@@ -1,11 +1,15 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/aria2/common"
 	"github.com/cloudreve/Cloudreve/v3/pkg/aria2/rpc"
 	"github.com/cloudreve/Cloudreve/v3/pkg/auth"
+	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
@@ -40,7 +44,7 @@ func (node *SlaveNode) Init(nodeModel *model.Node) {
 	var endpoint *url.URL
 	if serverURL, err := url.Parse(node.Model.Server); err == nil {
 		var controller *url.URL
-		controller, _ = url.Parse("/api/v3/slave")
+		controller, _ = url.Parse("/api/v3/slave/")
 		endpoint = serverURL.ResolveReference(controller)
 	}
 
@@ -168,7 +172,7 @@ func (node *SlaveNode) StartPingLoop() {
 	recoverDuration := time.Duration(model.GetIntSetting("slave_recover_interval", 600)) * time.Second
 	pingTicker := time.Duration(0)
 
-	util.Log().Debug("从机节点 [%s] 启动心跳循环", node.Model.Name)
+	util.Log().Debug("Slave node %q heartbeat loop started.", node.Model.Name)
 	retry := 0
 	recoverMode := false
 	isFirstLoop := true
@@ -181,39 +185,39 @@ loop:
 				pingTicker = tickDuration
 			}
 
-			util.Log().Debug("从机节点 [%s] 发送Ping", node.Model.Name)
+			util.Log().Debug("Slave node %q send ping.", node.Model.Name)
 			res, err := node.Ping(node.getHeartbeatContent(isFirstLoop))
 			isFirstLoop = false
 
 			if err != nil {
-				util.Log().Debug("Ping从机节点 [%s] 时发生错误: %s", node.Model.Name, err)
+				util.Log().Debug("Error while ping slave node %q: %s", node.Model.Name, err)
 				retry++
 				if retry >= model.GetIntSetting("slave_node_retry", 3) {
-					util.Log().Debug("从机节点 [%s] Ping 重试已达到最大限制，将从机节点标记为不可用", node.Model.Name)
+					util.Log().Debug("Retry threshold for pinging slave node %q exceeded, mark it as offline.", node.Model.Name)
 					node.changeStatus(false)
 
 					if !recoverMode {
 						// 启动恢复监控循环
-						util.Log().Debug("从机节点 [%s] 进入恢复模式", node.Model.Name)
+						util.Log().Debug("Slave node %q entered recovery mode.", node.Model.Name)
 						pingTicker = recoverDuration
 						recoverMode = true
 					}
 				}
 			} else {
 				if recoverMode {
-					util.Log().Debug("从机节点 [%s] 复活", node.Model.Name)
+					util.Log().Debug("Slave node %q recovered.", node.Model.Name)
 					pingTicker = tickDuration
 					recoverMode = false
 					isFirstLoop = true
 				}
 
-				util.Log().Debug("从机节点 [%s] 状态: %s", node.Model.Name, res)
+				util.Log().Debug("Status of slave node %q: %s", node.Model.Name, res)
 				node.changeStatus(true)
 				retry = 0
 			}
 
 		case <-node.close:
-			util.Log().Debug("从机节点 [%s] 收到关闭信号", node.Model.Name)
+			util.Log().Debug("Slave node %q received shutdown signal.", node.Model.Name)
 			break loop
 		}
 	}
@@ -407,4 +411,41 @@ func getAria2RequestBody(body *serializer.SlaveAria2Call) (io.Reader, error) {
 	}
 
 	return strings.NewReader(string(reqBodyEncoded)), nil
+}
+
+// RemoteCallback 发送远程存储策略上传回调请求
+func RemoteCallback(url string, body serializer.UploadCallback) error {
+	callbackBody, err := json.Marshal(struct {
+		Data serializer.UploadCallback `json:"data"`
+	}{
+		Data: body,
+	})
+	if err != nil {
+		return serializer.NewError(serializer.CodeCallbackError, "Failed to encode callback content", err)
+	}
+
+	resp := request.GeneralClient.Request(
+		"POST",
+		url,
+		bytes.NewReader(callbackBody),
+		request.WithTimeout(time.Duration(conf.SlaveConfig.CallbackTimeout)*time.Second),
+		request.WithCredential(auth.General, int64(conf.SlaveConfig.SignatureTTL)),
+	)
+
+	if resp.Err != nil {
+		return serializer.NewError(serializer.CodeCallbackError, "Slave cannot send callback request", resp.Err)
+	}
+
+	// 解析回调服务端响应
+	response, err := resp.DecodeResponse()
+	if err != nil {
+		msg := fmt.Sprintf("Slave cannot parse callback response from master (StatusCode=%d).", resp.Response.StatusCode)
+		return serializer.NewError(serializer.CodeCallbackError, msg, err)
+	}
+
+	if response.Code != 0 {
+		return serializer.NewError(response.Code, response.Msg, errors.New(response.Error))
+	}
+
+	return nil
 }

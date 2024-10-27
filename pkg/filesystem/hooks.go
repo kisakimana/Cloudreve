@@ -2,17 +2,18 @@ package filesystem
 
 import (
 	"context"
-	"errors"
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
-	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
+	"github.com/cloudreve/Cloudreve/v3/pkg/cluster"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/local"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
-	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"io/ioutil"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Hook 钩子函数
@@ -46,7 +47,7 @@ func (fs *FileSystem) Trigger(ctx context.Context, name string, file fsctx.FileH
 		for _, hook := range hooks {
 			err := hook(ctx, fs, file)
 			if err != nil {
-				util.Log().Warning("钩子执行失败：%s", err)
+				util.Log().Warning("Failed to execute hook：%s", err)
 				return err
 			}
 		}
@@ -114,7 +115,7 @@ func HookDeleteTempFile(ctx context.Context, fs *FileSystem, file fsctx.FileHead
 	// 删除临时文件
 	_, err := fs.Handler.Delete(ctx, []string{file.Info().SavePath})
 	if err != nil {
-		util.Log().Warning("无法清理上传临时文件，%s", err)
+		util.Log().Warning("Failed to clean-up temp files: %s", err)
 	}
 
 	return nil
@@ -150,7 +151,6 @@ func HookCancelContext(ctx context.Context, fs *FileSystem, file fsctx.FileHeade
 }
 
 // HookUpdateSourceName 更新文件SourceName
-// TODO：测试
 func HookUpdateSourceName(ctx context.Context, fs *FileSystem, file fsctx.FileHeader) error {
 	originFile, ok := ctx.Value(fsctx.FileModelCtx).(model.File)
 	if !ok {
@@ -178,44 +178,26 @@ func GenericAfterUpdate(ctx context.Context, fs *FileSystem, newFile fsctx.FileH
 }
 
 // SlaveAfterUpload Slave模式下上传完成钩子
-func SlaveAfterUpload(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
-	return errors.New("")
-	policy := ctx.Value(fsctx.UploadPolicyCtx).(serializer.UploadPolicy)
-	fileInfo := fileHeader.Info()
+func SlaveAfterUpload(session *serializer.UploadSession) Hook {
+	return func(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
+		if session.Callback == "" {
+			return nil
+		}
 
-	// 构造一个model.File，用于生成缩略图
-	file := model.File{
-		Name:       fileInfo.FileName,
-		SourceName: fileInfo.SavePath,
+		// 发送回调请求
+		callbackBody := serializer.UploadCallback{}
+		return cluster.RemoteCallback(session.Callback, callbackBody)
 	}
-	fs.GenerateThumbnail(ctx, &file)
-
-	if policy.CallbackURL == "" {
-		return nil
-	}
-
-	// 发送回调请求
-	callbackBody := serializer.UploadCallback{
-		Name:       file.Name,
-		SourceName: file.SourceName,
-		PicInfo:    file.PicInfo,
-		Size:       fileInfo.Size,
-	}
-	return request.RemoteCallback(policy.CallbackURL, callbackBody)
 }
 
 // GenericAfterUpload 文件上传完成后，包含数据库操作
 func GenericAfterUpload(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
 	fileInfo := fileHeader.Info()
 
-	// 检查路径是否存在，不存在就创建
-	isExist, folder := fs.IsPathExist(fileInfo.VirtualPath)
-	if !isExist {
-		newFolder, err := fs.CreateDirectory(ctx, fileInfo.VirtualPath)
-		if err != nil {
-			return err
-		}
-		folder = newFolder
+	// 创建或查找根目录
+	folder, err := fs.CreateDirectory(ctx, fileInfo.VirtualPath)
+	if err != nil {
+		return err
 	}
 
 	// 检查文件是否存在
@@ -237,21 +219,6 @@ func GenericAfterUpload(ctx context.Context, fs *FileSystem, fileHeader fsctx.Fi
 	}
 	fileHeader.SetModel(file)
 
-	return nil
-}
-
-// HookGenerateThumb 生成缩略图
-func HookGenerateThumb(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
-	// 异步尝试生成缩略图
-	fileMode := fileHeader.Info().Model.(*model.File)
-	if fs.Policy.IsThumbGenerateNeeded() {
-		fs.recycleLock.Lock()
-		go func() {
-			defer fs.recycleLock.Unlock()
-			_, _ = fs.Handler.Delete(ctx, []string{fileMode.SourceName + conf.ThumbConfig.FileSuffix})
-			fs.GenerateThumbnail(ctx, fileMode)
-		}()
-	}
 	return nil
 }
 
@@ -288,18 +255,50 @@ func HookChunkUploadFailed(ctx context.Context, fs *FileSystem, fileHeader fsctx
 	return fileInfo.Model.(*model.File).UpdateSize(fileInfo.AppendStart)
 }
 
-// HookChunkUploadFinished 分片上传结束后处理文件
-func HookChunkUploadFinished(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
-	fileInfo := fileHeader.Info()
-	fileModel := fileInfo.Model.(*model.File)
-
-	return fileModel.PopChunkToFile(fileInfo.LastModified)
+// HookPopPlaceholderToFile 将占位文件提升为正式文件
+func HookPopPlaceholderToFile(picInfo string) Hook {
+	return func(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
+		fileInfo := fileHeader.Info()
+		fileModel := fileInfo.Model.(*model.File)
+		return fileModel.PopChunkToFile(fileInfo.LastModified, picInfo)
+	}
 }
 
 // HookChunkUploadFinished 分片上传结束后处理文件
 func HookDeleteUploadSession(id string) Hook {
 	return func(ctx context.Context, fs *FileSystem, fileHeader fsctx.FileHeader) error {
 		cache.Deletes([]string{id}, UploadSessionCachePrefix)
+		return nil
+	}
+}
+
+// NewWebdavAfterUploadHook 每次创建一个新的钩子函数 rclone 在 PUT 请求里有 OC-Checksum 字符串
+// 和 X-OC-Mtime
+func NewWebdavAfterUploadHook(request *http.Request) func(ctx context.Context, fs *FileSystem, newFile fsctx.FileHeader) error {
+	var modtime time.Time
+	if timeVal := request.Header.Get("X-OC-Mtime"); timeVal != "" {
+		timeUnix, err := strconv.ParseInt(timeVal, 10, 64)
+		if err == nil {
+			modtime = time.Unix(timeUnix, 0)
+		}
+	}
+	checksum := request.Header.Get("OC-Checksum")
+
+	return func(ctx context.Context, fs *FileSystem, newFile fsctx.FileHeader) error {
+		file := newFile.Info().Model.(*model.File)
+		if !modtime.IsZero() {
+			err := model.DB.Model(file).UpdateColumn("updated_at", modtime).Error
+			if err != nil {
+				return err
+			}
+		}
+
+		if checksum != "" {
+			return file.UpdateMetadata(map[string]string{
+				model.ChecksumMetadataKey: checksum,
+			})
+		}
+
 		return nil
 	}
 }

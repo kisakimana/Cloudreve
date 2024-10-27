@@ -59,3 +59,11 @@ func TestInit(t *testing.T) {
 		Init()
 	})
 }
+
+func TestInitSlaveOverwrites(t *testing.T) {
+	asserts := assert.New(t)
+
+	asserts.NotPanics(func() {
+		InitSlaveOverwrites()
+	})
+}

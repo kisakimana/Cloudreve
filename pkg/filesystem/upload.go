@@ -23,6 +23,8 @@ import (
 
 const (
 	UploadSessionMetaKey     = "upload_session"
+	UploadSessionCtx         = "uploadSession"
+	UserCtx                  = "user"
 	UploadSessionCachePrefix = "callback_"
 )
 
@@ -47,11 +49,11 @@ func (fs *FileSystem) Upload(ctx context.Context, file *fsctx.FileStream) (err e
 		file.SavePath = savePath
 	}
 
-	// 处理客户端未完成上传时，关闭连接
-	go fs.CancelUpload(ctx, savePath, file)
-
 	// 保存文件
 	if file.Mode&fsctx.Nop != fsctx.Nop {
+		// 处理客户端未完成上传时，关闭连接
+		go fs.CancelUpload(ctx, savePath, file)
+
 		err = fs.Handler.Put(ctx, file)
 		if err != nil {
 			fs.Trigger(ctx, "AfterUploadFailed", file)
@@ -67,21 +69,12 @@ func (fs *FileSystem) Upload(ctx context.Context, file *fsctx.FileStream) (err e
 		followUpErr := fs.Trigger(ctx, "AfterValidateFailed", file)
 		// 失败后再失败...
 		if followUpErr != nil {
-			util.Log().Debug("AfterValidateFailed 钩子执行失败，%s", followUpErr)
+			util.Log().Debug("AfterValidateFailed hook execution failed: %s", followUpErr)
 		}
 
 		return err
 	}
 
-	if file.Mode&fsctx.Overwrite == 0 {
-		fileInfo := file.Info()
-		util.Log().Info(
-			"新文件PUT:%s , 大小:%d, 上传者:%s",
-			fileInfo.FileName,
-			fileInfo.Size,
-			fs.User.Nick,
-		)
-	}
 	return nil
 }
 
@@ -89,40 +82,17 @@ func (fs *FileSystem) Upload(ctx context.Context, file *fsctx.FileStream) (err e
 // TODO 完善测试
 func (fs *FileSystem) GenerateSavePath(ctx context.Context, file fsctx.FileHeader) string {
 	fileInfo := file.Info()
-
-	if fs.User.Model.ID != 0 {
-		return path.Join(
-			fs.Policy.GeneratePath(
-				fs.User.Model.ID,
-				fileInfo.VirtualPath,
-			),
-			fs.Policy.GenerateFileName(
-				fs.User.Model.ID,
-				fileInfo.FileName,
-			),
-		)
-	}
-
-	// 匿名文件系统尝试根据上下文中的上传策略生成路径
-	var anonymousPolicy model.Policy
-	if policy, ok := ctx.Value(fsctx.UploadPolicyCtx).(serializer.UploadPolicy); ok {
-		anonymousPolicy = model.Policy{
-			Type:         "remote",
-			AutoRename:   policy.AutoRename,
-			DirNameRule:  policy.SavePath,
-			FileNameRule: policy.FileName,
-		}
-	}
 	return path.Join(
-		anonymousPolicy.GeneratePath(
-			0,
-			"",
+		fs.Policy.GeneratePath(
+			fs.User.Model.ID,
+			fileInfo.VirtualPath,
 		),
-		anonymousPolicy.GenerateFileName(
-			0,
+		fs.Policy.GenerateFileName(
+			fs.User.Model.ID,
 			fileInfo.FileName,
 		),
 	)
+
 }
 
 // CancelUpload 监测客户端取消上传
@@ -143,13 +113,13 @@ func (fs *FileSystem) CancelUpload(ctx context.Context, path string, file fsctx.
 			// 客户端正常关闭，不执行操作
 		default:
 			// 客户端取消上传，删除临时文件
-			util.Log().Debug("客户端取消上传")
+			util.Log().Debug("Client canceled upload.")
 			if fs.Hooks["AfterUploadCanceled"] == nil {
 				return
 			}
 			err := fs.Trigger(ctx, "AfterUploadCanceled", file)
 			if err != nil {
-				util.Log().Debug("执行 AfterUploadCanceled 钩子出错，%s", err)
+				util.Log().Debug("AfterUploadCanceled hook execution failed: %s", err)
 			}
 		}
 
@@ -172,24 +142,22 @@ func (fs *FileSystem) CreateUploadSession(ctx context.Context, file *fsctx.FileS
 
 	fs.Use("BeforeUpload", HookValidateFile)
 	fs.Use("BeforeUpload", HookValidateCapacity)
-	if !fs.Policy.IsUploadPlaceholderWithSize() {
-		fs.Use("AfterUpload", HookClearFileHeaderSize)
-	}
 
-	fs.Use("AfterUpload", GenericAfterUpload)
+	// 验证文件规格
 	if err := fs.Upload(ctx, file); err != nil {
 		return nil, err
 	}
 
 	uploadSession := &serializer.UploadSession{
-		Key:          callbackKey,
-		UID:          fs.User.ID,
-		Policy:       *fs.Policy,
-		VirtualPath:  file.VirtualPath,
-		Name:         file.Name,
-		Size:         fileSize,
-		SavePath:     file.SavePath,
-		LastModified: file.LastModified,
+		Key:            callbackKey,
+		UID:            fs.User.ID,
+		Policy:         *fs.Policy,
+		VirtualPath:    file.VirtualPath,
+		Name:           file.Name,
+		Size:           fileSize,
+		SavePath:       file.SavePath,
+		LastModified:   file.LastModified,
+		CallbackSecret: util.RandStringRunes(32),
 	}
 
 	// 获取上传凭证
@@ -198,10 +166,20 @@ func (fs *FileSystem) CreateUploadSession(ctx context.Context, file *fsctx.FileS
 		return nil, err
 	}
 
+	// 创建占位符
+	if !fs.Policy.IsUploadPlaceholderWithSize() {
+		fs.Use("AfterUpload", HookClearFileHeaderSize)
+	}
+	fs.Use("AfterUpload", GenericAfterUpload)
+	ctx = context.WithValue(ctx, fsctx.IgnoreDirectoryConflictCtx, true)
+	if err := fs.Upload(ctx, file); err != nil {
+		return nil, err
+	}
+
 	// 创建回调会话
 	err = cache.Set(
 		UploadSessionCachePrefix+callbackKey,
-		uploadSession,
+		*uploadSession,
 		callBackSessionTTL,
 	)
 	if err != nil {
@@ -215,7 +193,16 @@ func (fs *FileSystem) CreateUploadSession(ctx context.Context, file *fsctx.FileS
 }
 
 // UploadFromStream 从文件流上传文件
-func (fs *FileSystem) UploadFromStream(ctx context.Context, file *fsctx.FileStream) error {
+func (fs *FileSystem) UploadFromStream(ctx context.Context, file *fsctx.FileStream, resetPolicy bool) error {
+	if resetPolicy {
+		// 重设存储策略
+		fs.Policy = &fs.User.Policy
+		err := fs.DispatchHandler()
+		if err != nil {
+			return err
+		}
+	}
+
 	// 给文件系统分配钩子
 	fs.Lock.Lock()
 	if fs.Hooks == nil {
@@ -223,7 +210,6 @@ func (fs *FileSystem) UploadFromStream(ctx context.Context, file *fsctx.FileStre
 		fs.Use("BeforeUpload", HookValidateCapacity)
 		fs.Use("AfterUploadCanceled", HookDeleteTempFile)
 		fs.Use("AfterUpload", GenericAfterUpload)
-		fs.Use("AfterUpload", HookGenerateThumb)
 		fs.Use("AfterValidateFailed", HookDeleteTempFile)
 	}
 	fs.Lock.Unlock()
@@ -233,16 +219,7 @@ func (fs *FileSystem) UploadFromStream(ctx context.Context, file *fsctx.FileStre
 }
 
 // UploadFromPath 将本机已有文件上传到用户的文件系统
-func (fs *FileSystem) UploadFromPath(ctx context.Context, src, dst string, resetPolicy bool, mode fsctx.WriteMode) error {
-	// 重设存储策略
-	if resetPolicy {
-		fs.Policy = &fs.User.Policy
-		err := fs.DispatchHandler()
-		if err != nil {
-			return err
-		}
-	}
-
+func (fs *FileSystem) UploadFromPath(ctx context.Context, src, dst string, mode fsctx.WriteMode) error {
 	file, err := os.Open(util.RelativePath(src))
 	if err != nil {
 		return err
@@ -258,10 +235,11 @@ func (fs *FileSystem) UploadFromPath(ctx context.Context, src, dst string, reset
 
 	// 开始上传
 	return fs.UploadFromStream(ctx, &fsctx.FileStream{
-		File:        nil,
+		File:        file,
+		Seeker:      file,
 		Size:        uint64(size),
 		Name:        path.Base(dst),
 		VirtualPath: path.Dir(dst),
 		Mode:        mode,
-	})
+	}, true)
 }

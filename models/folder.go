@@ -18,15 +18,18 @@ type Folder struct {
 	OwnerID  uint   `gorm:"index:owner_id"`
 
 	// 数据库忽略字段
-	Position string `gorm:"-"`
+	Position      string `gorm:"-"`
+	WebdavDstName string `gorm:"-"`
 }
 
 // Create 创建目录
 func (folder *Folder) Create() (uint, error) {
-	if err := DB.Create(folder).Error; err != nil {
-		util.Log().Warning("无法插入目录记录, %s", err)
-		return 0, err
+	if err := DB.FirstOrCreate(folder, *folder).Error; err != nil {
+		folder.Model = gorm.Model{}
+		err2 := DB.First(folder, *folder).Error
+		return folder.ID, err2
 	}
+
 	return folder.ID, nil
 }
 
@@ -159,13 +162,18 @@ func (folder *Folder) MoveOrCopyFileTo(files []uint, dstFolder *Folder, isCopy b
 		// 复制文件记录
 		for _, oldFile := range originFiles {
 			if !oldFile.CanCopy() {
-				util.Log().Warning("无法复制正在上传中的文件 [%s]， 跳过...", oldFile.Name)
+				util.Log().Warning("Cannot copy file %q because it's being uploaded now, skipping...", oldFile.Name)
 				continue
 			}
 
 			oldFile.Model = gorm.Model{}
 			oldFile.FolderID = dstFolder.ID
 			oldFile.UserID = dstFolder.OwnerID
+
+			// webdav目标名重置
+			if dstFolder.WebdavDstName != "" {
+				oldFile.Name = dstFolder.WebdavDstName
+			}
 
 			if err := DB.Create(&oldFile).Error; err != nil {
 				return copiedSize, err
@@ -175,6 +183,14 @@ func (folder *Folder) MoveOrCopyFileTo(files []uint, dstFolder *Folder, isCopy b
 		}
 
 	} else {
+		var updates = map[string]interface{}{
+			"folder_id": dstFolder.ID,
+		}
+		// webdav目标名重置
+		if dstFolder.WebdavDstName != "" {
+			updates["name"] = dstFolder.WebdavDstName
+		}
+
 		// 更改顶级要移动文件的父目录指向
 		err := DB.Model(File{}).Where(
 			"id in (?) and user_id = ? and folder_id = ?",
@@ -182,9 +198,7 @@ func (folder *Folder) MoveOrCopyFileTo(files []uint, dstFolder *Folder, isCopy b
 			folder.OwnerID,
 			folder.ID,
 		).
-			Update(map[string]interface{}{
-				"folder_id": dstFolder.ID,
-			}).
+			Update(updates).
 			Error
 		if err != nil {
 			return 0, err
@@ -219,11 +233,15 @@ func (folder *Folder) CopyFolderTo(folderID uint, dstFolder *Folder) (size uint6
 		// 顶级目录直接指向新的目的目录
 		if folder.ID == folderID {
 			newID = dstFolder.ID
+			// webdav目标名重置
+			if dstFolder.WebdavDstName != "" {
+				folder.Name = dstFolder.WebdavDstName
+			}
 		} else if IDCache, ok := newIDCache[*folder.ParentID]; ok {
 			newID = IDCache
 		} else {
-			util.Log().Warning("无法取得新的父目录:%d", folder.ParentID)
-			return size, errors.New("无法取得新的父目录")
+			util.Log().Warning("Failed to get parent folder %q", *folder.ParentID)
+			return size, errors.New("Failed to get parent folder")
 		}
 
 		// 插入新的目录记录
@@ -252,7 +270,7 @@ func (folder *Folder) CopyFolderTo(folderID uint, dstFolder *Folder) (size uint6
 	// 复制文件记录
 	for _, oldFile := range originFiles {
 		if !oldFile.CanCopy() {
-			util.Log().Warning("无法复制正在上传中的文件 [%s]， 跳过...", oldFile.Name)
+			util.Log().Warning("Cannot copy file %q because it's being uploaded now, skipping...", oldFile.Name)
 			continue
 		}
 
@@ -280,15 +298,21 @@ func (folder *Folder) MoveFolderTo(dirs []uint, dstFolder *Folder) error {
 		return errors.New("cannot move a folder into itself")
 	}
 
+	var updates = map[string]interface{}{
+		"parent_id": dstFolder.ID,
+	}
+	// webdav目标名重置
+	if dstFolder.WebdavDstName != "" {
+		updates["name"] = dstFolder.WebdavDstName
+	}
+
 	// 更改顶级要移动目录的父目录指向
 	err := DB.Model(Folder{}).Where(
 		"id in (?) and owner_id = ? and parent_id = ?",
 		dirs,
 		folder.OwnerID,
 		folder.ID,
-	).Update(map[string]interface{}{
-		"parent_id": dstFolder.ID,
-	}).Error
+	).Update(updates).Error
 
 	return err
 
@@ -296,10 +320,7 @@ func (folder *Folder) MoveFolderTo(dirs []uint, dstFolder *Folder) error {
 
 // Rename 重命名目录
 func (folder *Folder) Rename(new string) error {
-	if err := DB.Model(&folder).Update("name", new).Error; err != nil {
-		return err
-	}
-	return nil
+	return DB.Model(&folder).UpdateColumn("name", new).Error
 }
 
 /*

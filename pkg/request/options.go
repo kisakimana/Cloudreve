@@ -5,6 +5,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/auth"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -14,15 +15,18 @@ type Option interface {
 }
 
 type options struct {
-	timeout       time.Duration
-	header        http.Header
-	sign          auth.Auth
-	signTTL       int64
-	ctx           context.Context
-	contentLength int64
-	masterMeta    bool
-	endpoint      *url.URL
-	slaveNodeID   string
+	timeout         time.Duration
+	header          http.Header
+	sign            auth.Auth
+	signTTL         int64
+	ctx             context.Context
+	contentLength   int64
+	masterMeta      bool
+	endpoint        *url.URL
+	slaveNodeID     string
+	tpsLimiterToken string
+	tps             float64
+	tpsBurst        int
 }
 
 type optionFunc func(*options)
@@ -36,7 +40,14 @@ func newDefaultOption() *options {
 		header:        http.Header{},
 		timeout:       time.Duration(30) * time.Second,
 		contentLength: -1,
+		ctx:           context.Background(),
 	}
+}
+
+func (o *options) clone() options {
+	newOptions := *o
+	newOptions.header = o.header.Clone()
+	return newOptions
 }
 
 // WithTimeout 设置请求超时
@@ -103,8 +114,24 @@ func WithSlaveMeta(s string) Option {
 
 // Endpoint 使用同一的请求Endpoint
 func WithEndpoint(endpoint string) Option {
+	if !strings.HasSuffix(endpoint, "/") {
+		endpoint += "/"
+	}
+
 	endpointURL, _ := url.Parse(endpoint)
 	return optionFunc(func(o *options) {
 		o.endpoint = endpointURL
+	})
+}
+
+// WithTPSLimit 请求时使用全局流量限制
+func WithTPSLimit(token string, tps float64, burst int) Option {
+	return optionFunc(func(o *options) {
+		o.tpsLimiterToken = token
+		o.tps = tps
+		if burst < 1 {
+			burst = 1
+		}
+		o.tpsBurst = burst
 	})
 }

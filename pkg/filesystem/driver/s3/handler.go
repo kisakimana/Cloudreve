@@ -2,19 +2,20 @@ package s3
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"github.com/cloudreve/Cloudreve/v3/pkg/util"
+	"fmt"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/chunk"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/chunk/backoff"
+	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -41,16 +42,28 @@ type UploadPolicy struct {
 	Conditions []interface{} `json:"conditions"`
 }
 
-//MetaData 文件信息
+// MetaData 文件信息
 type MetaData struct {
 	Size uint64
 	Etag string
 }
 
+func NewDriver(policy *model.Policy) (*Driver, error) {
+	if policy.OptionsSerialized.ChunkSize == 0 {
+		policy.OptionsSerialized.ChunkSize = 25 << 20 // 25 MB
+	}
+
+	driver := &Driver{
+		Policy: policy,
+	}
+
+	return driver, driver.InitS3Client()
+}
+
 // InitS3Client 初始化S3会话
 func (handler *Driver) InitS3Client() error {
 	if handler.Policy == nil {
-		return errors.New("存储策略为空")
+		return errors.New("empty policy")
 	}
 
 	if handler.svc == nil {
@@ -59,7 +72,7 @@ func (handler *Driver) InitS3Client() error {
 			Credentials:      credentials.NewStaticCredentials(handler.Policy.AccessKey, handler.Policy.SecretKey, ""),
 			Endpoint:         &handler.Policy.Server,
 			Region:           &handler.Policy.OptionsSerialized.Region,
-			S3ForcePathStyle: aws.Bool(true),
+			S3ForcePathStyle: &handler.Policy.OptionsSerialized.S3ForcePathStyle,
 		})
 
 		if err != nil {
@@ -72,13 +85,7 @@ func (handler *Driver) InitS3Client() error {
 }
 
 // List 列出给定路径下的文件
-func (handler Driver) List(ctx context.Context, base string, recursive bool) ([]response.Object, error) {
-
-	// 初始化客户端
-	if err := handler.InitS3Client(); err != nil {
-		return nil, err
-	}
-
+func (handler *Driver) List(ctx context.Context, base string, recursive bool) ([]response.Object, error) {
 	// 初始化列目录参数
 	base = strings.TrimPrefix(base, "/")
 	if base != "" {
@@ -155,17 +162,9 @@ func (handler Driver) List(ctx context.Context, base string, recursive bool) ([]
 }
 
 // Get 获取文件
-func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, error) {
-
+func (handler *Driver) Get(ctx context.Context, path string) (response.RSCloser, error) {
 	// 获取文件源地址
-	downloadURL, err := handler.Source(
-		ctx,
-		path,
-		url.URL{},
-		int64(model.GetIntSetting("preview_timeout", 60)),
-		false,
-		0,
-	)
+	downloadURL, err := handler.Source(ctx, path, int64(model.GetIntSetting("preview_timeout", 60)), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +196,7 @@ func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, 
 }
 
 // Put 将文件流保存到指定目录
-func (handler Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
+func (handler *Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
 	defer file.Close()
 
 	// 初始化客户端
@@ -205,13 +204,15 @@ func (handler Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
 		return err
 	}
 
-	uploader := s3manager.NewUploader(handler.sess)
+	uploader := s3manager.NewUploader(handler.sess, func(u *s3manager.Uploader) {
+		u.PartSize = int64(handler.Policy.OptionsSerialized.ChunkSize)
+	})
 
 	dst := file.Info().SavePath
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: &handler.Policy.BucketName,
 		Key:    &dst,
-		Body:   file,
+		Body:   io.LimitReader(file, int64(file.Info().Size)),
 	})
 
 	if err != nil {
@@ -223,13 +224,7 @@ func (handler Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
 
 // Delete 删除一个或多个文件，
 // 返回未删除的文件，及遇到的最后一个错误
-func (handler Driver) Delete(ctx context.Context, files []string) ([]string, error) {
-
-	// 初始化客户端
-	if err := handler.InitS3Client(); err != nil {
-		return files, err
-	}
-
+func (handler *Driver) Delete(ctx context.Context, files []string) ([]string, error) {
 	failed := make([]string, 0, len(files))
 	deleted := make([]string, 0, len(files))
 
@@ -256,26 +251,19 @@ func (handler Driver) Delete(ctx context.Context, files []string) ([]string, err
 	for _, deleteRes := range res.Deleted {
 		deleted = append(deleted, *deleteRes.Key)
 	}
-	failed = util.SliceDifference(failed, deleted)
+	failed = util.SliceDifference(files, deleted)
 
 	return failed, nil
 
 }
 
 // Thumb 获取文件缩略图
-func (handler Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
-	return nil, errors.New("未实现")
+func (handler *Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
+	return nil, driver.ErrorThumbNotSupported
 }
 
 // Source 获取外链URL
-func (handler Driver) Source(
-	ctx context.Context,
-	path string,
-	baseURL url.URL,
-	ttl int64,
-	isDownload bool,
-	speed int,
-) (string, error) {
+func (handler *Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 
 	// 尝试从上下文获取文件名
 	fileName := ""
@@ -288,18 +276,21 @@ func (handler Driver) Source(
 		return "", err
 	}
 
+	contentDescription := aws.String("attachment; filename=\"" + url.PathEscape(fileName) + "\"")
+	if !isDownload {
+		contentDescription = nil
+	}
 	req, _ := handler.svc.GetObjectRequest(
 		&s3.GetObjectInput{
 			Bucket:                     &handler.Policy.BucketName,
 			Key:                        &path,
-			ResponseContentDisposition: aws.String("attachment; filename=\"" + url.PathEscape(fileName) + "\""),
+			ResponseContentDisposition: contentDescription,
 		})
 
-	if ttl == 0 {
-		ttl = 3600
+	signedURL, err := req.Presign(time.Duration(ttl) * time.Second)
+	if err != nil {
+		return "", err
 	}
-
-	signedURL, _ := req.Presign(time.Duration(ttl) * time.Second)
 
 	// 将最终生成的签名URL域名换成用户自定义的加速域名（如果有）
 	finalURL, err := url.Parse(signedURL)
@@ -325,44 +316,78 @@ func (handler Driver) Source(
 }
 
 // Token 获取上传策略和认证Token
-func (handler Driver) Token(ctx context.Context, ttl int64, uploadSession *serializer.UploadSession, file fsctx.FileHeader) (*serializer.UploadCredential, error) {
-	// 生成回调地址
-	siteURL := model.GetSiteURL()
-	apiBaseURI, _ := url.Parse("/api/v3/callback/s3/" + uploadSession.Key)
-	apiURL := siteURL.ResolveReference(apiBaseURI)
-
-	// 上传策略
-	savePath := file.Info().SavePath
-	putPolicy := UploadPolicy{
-		Expiration: time.Now().UTC().Add(time.Duration(ttl) * time.Second).Format(time.RFC3339),
-		Conditions: []interface{}{
-			map[string]string{"bucket": handler.Policy.BucketName},
-			[]string{"starts-with", "$key", savePath},
-			[]string{"starts-with", "$success_action_redirect", apiURL.String()},
-			[]string{"starts-with", "$name", ""},
-			[]string{"starts-with", "$Content-Type", ""},
-			map[string]string{"x-amz-algorithm": "AWS4-HMAC-SHA256"},
-		},
+func (handler *Driver) Token(ctx context.Context, ttl int64, uploadSession *serializer.UploadSession, file fsctx.FileHeader) (*serializer.UploadCredential, error) {
+	// 检查文件是否存在
+	fileInfo := file.Info()
+	if _, err := handler.Meta(ctx, fileInfo.SavePath); err == nil {
+		return nil, fmt.Errorf("file already exist")
 	}
 
-	if handler.Policy.MaxSize > 0 {
-		putPolicy.Conditions = append(putPolicy.Conditions,
-			[]interface{}{"content-length-range", 0, handler.Policy.MaxSize})
+	// 创建分片上传
+	expires := time.Now().Add(time.Duration(ttl) * time.Second)
+	res, err := handler.svc.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		Bucket:      &handler.Policy.BucketName,
+		Key:         &fileInfo.SavePath,
+		Expires:     &expires,
+		ContentType: aws.String(fileInfo.DetectMimeType()),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create multipart upload: %w", err)
 	}
 
-	// 生成上传凭证
-	return handler.getUploadCredential(ctx, putPolicy, apiURL, savePath)
-}
+	uploadSession.UploadID = *res.UploadId
 
-// Meta 获取文件信息
-func (handler Driver) Meta(ctx context.Context, path string) (*MetaData, error) {
-	// 初始化客户端
-	if err := handler.InitS3Client(); err != nil {
+	// 为每个分片签名上传 URL
+	chunks := chunk.NewChunkGroup(file, handler.Policy.OptionsSerialized.ChunkSize, &backoff.ConstantBackoff{}, false)
+	urls := make([]string, chunks.Num())
+	for chunks.Next() {
+		err := chunks.Process(func(c *chunk.ChunkGroup, chunk io.Reader) error {
+			signedReq, _ := handler.svc.UploadPartRequest(&s3.UploadPartInput{
+				Bucket:     &handler.Policy.BucketName,
+				Key:        &fileInfo.SavePath,
+				PartNumber: aws.Int64(int64(c.Index() + 1)),
+				UploadId:   res.UploadId,
+			})
+
+			signedURL, err := signedReq.Presign(time.Duration(ttl) * time.Second)
+			if err != nil {
+				return err
+			}
+
+			urls[c.Index()] = signedURL
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 签名完成分片上传的请求URL
+	signedReq, _ := handler.svc.CompleteMultipartUploadRequest(&s3.CompleteMultipartUploadInput{
+		Bucket:   &handler.Policy.BucketName,
+		Key:      &fileInfo.SavePath,
+		UploadId: res.UploadId,
+	})
+
+	signedURL, err := signedReq.Presign(time.Duration(ttl) * time.Second)
+	if err != nil {
 		return nil, err
 	}
 
-	res, err := handler.svc.GetObject(
-		&s3.GetObjectInput{
+	// 生成上传凭证
+	return &serializer.UploadCredential{
+		SessionID:   uploadSession.Key,
+		ChunkSize:   handler.Policy.OptionsSerialized.ChunkSize,
+		UploadID:    *res.UploadId,
+		UploadURLs:  urls,
+		CompleteURL: signedURL,
+	}, nil
+}
+
+// Meta 获取文件信息
+func (handler *Driver) Meta(ctx context.Context, path string) (*MetaData, error) {
+	res, err := handler.svc.HeadObject(
+		&s3.HeadObjectInput{
 			Bucket: &handler.Policy.BucketName,
 			Key:    &path,
 		})
@@ -378,52 +403,8 @@ func (handler Driver) Meta(ctx context.Context, path string) (*MetaData, error) 
 
 }
 
-func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPolicy, callback *url.URL, savePath string) (*serializer.UploadCredential, error) {
-
-	longDate := time.Now().UTC().Format("20060102T150405Z")
-	shortDate := time.Now().UTC().Format("20060102")
-
-	credential := handler.Policy.AccessKey + "/" + shortDate + "/" + handler.Policy.OptionsSerialized.Region + "/s3/aws4_request"
-	policy.Conditions = append(policy.Conditions, map[string]string{"x-amz-credential": credential})
-	policy.Conditions = append(policy.Conditions, map[string]string{"x-amz-date": longDate})
-
-	// 编码上传策略
-	policyJSON, err := json.Marshal(policy)
-	if err != nil {
-		return nil, err
-	}
-	policyEncoded := base64.StdEncoding.EncodeToString(policyJSON)
-
-	//签名
-	signature := getHMAC([]byte("AWS4"+handler.Policy.SecretKey), []byte(shortDate))
-	signature = getHMAC(signature, []byte(handler.Policy.OptionsSerialized.Region))
-	signature = getHMAC(signature, []byte("s3"))
-	signature = getHMAC(signature, []byte("aws4_request"))
-	signature = getHMAC(signature, []byte(policyEncoded))
-
-	return &serializer.UploadCredential{
-		Policy:    policyEncoded,
-		Callback:  callback.String(),
-		Token:     hex.EncodeToString(signature),
-		AccessKey: credential,
-		Path:      savePath,
-		KeyTime:   longDate,
-	}, nil
-}
-
-func getHMAC(key []byte, data []byte) []byte {
-	hash := hmac.New(sha256.New, key)
-	hash.Write(data)
-	return hash.Sum(nil)
-}
-
 // CORS 创建跨域策略
-func (handler Driver) CORS() error {
-	// 初始化客户端
-	if err := handler.InitS3Client(); err != nil {
-		return err
-	}
-
+func (handler *Driver) CORS() error {
 	rule := s3.CORSRule{
 		AllowedMethods: aws.StringSlice([]string{
 			"GET",
@@ -434,6 +415,7 @@ func (handler Driver) CORS() error {
 		}),
 		AllowedOrigins: aws.StringSlice([]string{"*"}),
 		AllowedHeaders: aws.StringSlice([]string{"*"}),
+		ExposeHeaders:  aws.StringSlice([]string{"ETag"}),
 		MaxAgeSeconds:  aws.Int64(3600),
 	}
 
@@ -448,6 +430,11 @@ func (handler Driver) CORS() error {
 }
 
 // 取消上传凭证
-func (handler Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
-	return nil
+func (handler *Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
+	_, err := handler.svc.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+		UploadId: &uploadSession.UploadID,
+		Bucket:   &handler.Policy.BucketName,
+		Key:      &uploadSession.SavePath,
+	})
+	return err
 }

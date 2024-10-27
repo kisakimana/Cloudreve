@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 
@@ -19,8 +20,9 @@ import (
 func TestFileSystem_AddFile(t *testing.T) {
 	asserts := assert.New(t)
 	file := fsctx.FileStream{
-		Size: 5,
-		Name: "1.png",
+		Size:     5,
+		Name:     "1.png",
+		SavePath: "/Uploads/1_sad.png",
 	}
 	folder := model.Folder{
 		Model: gorm.Model{
@@ -39,24 +41,54 @@ func TestFileSystem_AddFile(t *testing.T) {
 				},
 			},
 		},
+		Policy: &model.Policy{Type: "cos"},
 	}
-	ctx := context.WithValue(context.Background(), fsctx.FileHeaderCtx, file)
-	ctx = context.WithValue(ctx, fsctx.SavePathCtx, "/Uploads/1_sad.png")
 
-	_, err := fs.AddFile(ctx, &folder)
+	_, err := fs.AddFile(context.Background(), &folder, &file)
 
 	asserts.Error(err)
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT(.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("UPDATE(.+)storage(.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	f, err := fs.AddFile(ctx, &folder)
+	f, err := fs.AddFile(context.Background(), &folder, &file)
 
 	asserts.NoError(err)
 	asserts.NoError(mock.ExpectationsWereMet())
 	asserts.Equal("/Uploads/1_sad.png", f.SourceName)
-	asserts.NotEmpty(f.PicInfo)
+
+	// 前置钩子执行失败
+	{
+		hookExecuted := false
+		fs.Use("BeforeAddFile", func(ctx context.Context, fs *FileSystem, file fsctx.FileHeader) error {
+			hookExecuted = true
+			return errors.New("error")
+		})
+		f, err := fs.AddFile(context.Background(), &folder, &file)
+		asserts.Error(err)
+		asserts.Nil(f)
+		asserts.True(hookExecuted)
+	}
+
+	// 后置钩子执行失败
+	{
+		hookExecuted := false
+		mock.ExpectBegin()
+		mock.ExpectExec("INSERT(.+)").WillReturnError(errors.New("error"))
+		mock.ExpectRollback()
+		fs.Hooks = map[string][]Hook{}
+		fs.Use("AfterValidateFailed", func(ctx context.Context, fs *FileSystem, file fsctx.FileHeader) error {
+			hookExecuted = true
+			return errors.New("error")
+		})
+		f, err := fs.AddFile(context.Background(), &folder, &file)
+		asserts.Error(err)
+		asserts.Nil(f)
+		asserts.True(hookExecuted)
+		asserts.NoError(mock.ExpectationsWereMet())
+	}
 }
 
 func TestFileSystem_GetContent(t *testing.T) {
@@ -263,6 +295,35 @@ func TestFileSystem_deleteGroupedFile(t *testing.T) {
 			3: {},
 		}, failed)
 	}
+	// 包含上传会话文件
+	{
+		sessionID := "session"
+		cache.Set(UploadSessionCachePrefix+sessionID, serializer.UploadSession{Key: sessionID}, 0)
+		files[1].Policy.Type = "local"
+		files[3].Policy.Type = "local"
+		files[0].UploadSessionID = &sessionID
+		failed := fs.deleteGroupedFile(ctx, fs.GroupFileByPolicy(ctx, files))
+		asserts.Equal(map[uint][]string{
+			1: {},
+			2: {},
+			3: {},
+		}, failed)
+		_, ok := cache.Get(UploadSessionCachePrefix + sessionID)
+		asserts.False(ok)
+	}
+
+	// 包含缩略图
+	{
+		files[0].MetadataSerialized = map[string]string{
+			model.ThumbSidecarMetadataKey: "1",
+		}
+		failed := fs.deleteGroupedFile(ctx, fs.GroupFileByPolicy(ctx, files))
+		asserts.Equal(map[uint][]string{
+			1: {},
+			2: {},
+			3: {},
+		}, failed)
+	}
 }
 
 func TestFileSystem_GetSource(t *testing.T) {
@@ -291,8 +352,6 @@ func TestFileSystem_GetSource(t *testing.T) {
 				sqlmock.NewRows([]string{"id", "type", "is_origin_link_enable"}).
 					AddRow(35, "local", true),
 			)
-		// 查找站点URL
-		mock.ExpectQuery("SELECT(.+)").WithArgs("siteURL").WillReturnRows(sqlmock.NewRows([]string{"id", "value"}).AddRow(1, "https://cloudreve.org"))
 
 		sourceURL, err := fs.GetSource(ctx, 2)
 		asserts.NoError(mock.ExpectationsWereMet())

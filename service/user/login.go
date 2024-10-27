@@ -3,12 +3,14 @@ package user
 import (
 	"fmt"
 	model "github.com/cloudreve/Cloudreve/v3/models"
+	"github.com/cloudreve/Cloudreve/v3/pkg/auth"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/email"
 	"github.com/cloudreve/Cloudreve/v3/pkg/hashid"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/gin-gonic/gin"
+	"github.com/gofrs/uuid"
 	"github.com/pquerna/otp/totp"
 	"net/url"
 )
@@ -37,24 +39,24 @@ func (service *UserResetService) Reset(c *gin.Context) serializer.Response {
 	// 取得原始用户ID
 	uid, err := hashid.DecodeHashID(service.ID, hashid.UserID)
 	if err != nil {
-		return serializer.Err(serializer.CodeNotFound, "重设链接无效", err)
+		return serializer.Err(serializer.CodeInvalidTempLink, "Invalid link", err)
 	}
 
 	// 检查重设会话
 	resetSession, exist := cache.Get(fmt.Sprintf("user_reset_%d", uid))
 	if !exist || resetSession.(string) != service.Secret {
-		return serializer.Err(serializer.CodeNotFound, "链接已过期", err)
+		return serializer.Err(serializer.CodeTempLinkExpired, "Link is expired", err)
 	}
 
 	// 重设用户密码
 	user, err := model.GetActiveUserByID(uid)
 	if err != nil {
-		return serializer.Err(serializer.CodeNotFound, "用户不存在", err)
+		return serializer.Err(serializer.CodeUserNotFound, "User not found", nil)
 	}
 
 	user.SetPassword(service.Password)
 	if err := user.Update(map[string]interface{}{"password": user.Password}); err != nil {
-		return serializer.DBErr("无法重设密码", err)
+		return serializer.DBErr("Failed to reset password", err)
 	}
 
 	cache.Deletes([]string{fmt.Sprintf("%d", uid)}, "user_reset_")
@@ -67,10 +69,10 @@ func (service *UserResetEmailService) Reset(c *gin.Context) serializer.Response 
 	if user, err := model.GetUserByEmail(service.UserName); err == nil {
 
 		if user.Status == model.Baned || user.Status == model.OveruseBaned {
-			return serializer.Err(403, "该账号已被封禁", nil)
+			return serializer.Err(serializer.CodeUserBaned, "This user is banned", nil)
 		}
 		if user.Status == model.NotActivicated {
-			return serializer.Err(403, "该账号未激活", nil)
+			return serializer.Err(serializer.CodeUserNotActivated, "This user is not activated", nil)
 		}
 		// 创建密码重设会话
 		secret := util.RandStringRunes(32)
@@ -87,7 +89,7 @@ func (service *UserResetEmailService) Reset(c *gin.Context) serializer.Response 
 		// 发送密码重设邮件
 		title, body := email.NewResetEmail(user.Nick, finalURL.String())
 		if err := email.Send(user.Email, title, body); err != nil {
-			return serializer.Err(serializer.CodeInternalSetting, "无法发送密码重设邮件", err)
+			return serializer.Err(serializer.CodeFailedSendEmail, "Failed to send email", err)
 		}
 
 	}
@@ -101,12 +103,12 @@ func (service *Enable2FA) Login(c *gin.Context) serializer.Response {
 		// 查找用户
 		expectedUser, err := model.GetActiveUserByID(uid)
 		if err != nil {
-			return serializer.Err(serializer.CodeNotFound, "用户不存在", nil)
+			return serializer.Err(serializer.CodeUserNotFound, "User not found", nil)
 		}
 
 		// 验证二步验证代码
 		if !totp.Validate(service.Code, expectedUser.TwoFactor) {
-			return serializer.ParamErr("验证代码不正确", nil)
+			return serializer.Err(serializer.Code2FACodeErr, "2FA code not correct", nil)
 		}
 
 		//登陆成功，清空并设置session
@@ -118,7 +120,7 @@ func (service *Enable2FA) Login(c *gin.Context) serializer.Response {
 		return serializer.BuildUserResponse(expectedUser)
 	}
 
-	return serializer.Err(serializer.CodeNotFound, "登录会话不存在", nil)
+	return serializer.Err(serializer.CodeLoginSessionNotExist, "Login session not exist", nil)
 }
 
 // Login 用户登录函数
@@ -126,16 +128,16 @@ func (service *UserLoginService) Login(c *gin.Context) serializer.Response {
 	expectedUser, err := model.GetUserByEmail(service.UserName)
 	// 一系列校验
 	if err != nil {
-		return serializer.Err(serializer.CodeCredentialInvalid, "用户邮箱或密码错误", err)
+		return serializer.Err(serializer.CodeCredentialInvalid, "Wrong password or email address", err)
 	}
 	if authOK, _ := expectedUser.CheckPassword(service.Password); !authOK {
-		return serializer.Err(serializer.CodeCredentialInvalid, "用户邮箱或密码错误", nil)
+		return serializer.Err(serializer.CodeCredentialInvalid, "Wrong password or email address", nil)
 	}
 	if expectedUser.Status == model.Baned || expectedUser.Status == model.OveruseBaned {
-		return serializer.Err(403, "该账号已被封禁", nil)
+		return serializer.Err(serializer.CodeUserBaned, "This account has been blocked", nil)
 	}
 	if expectedUser.Status == model.NotActivicated {
-		return serializer.Err(403, "该账号未激活", nil)
+		return serializer.Err(serializer.CodeUserNotActivated, "This account is not activated", nil)
 	}
 
 	if expectedUser.TwoFactor != "" {
@@ -153,4 +155,49 @@ func (service *UserLoginService) Login(c *gin.Context) serializer.Response {
 
 	return serializer.BuildUserResponse(expectedUser)
 
+}
+
+// CopySessionService service for copy user session
+type CopySessionService struct {
+	ID string `uri:"id" binding:"required,uuid4"`
+}
+
+const CopySessionTTL = 60
+
+// Prepare generates the URL with short expiration duration
+func (s *CopySessionService) Prepare(c *gin.Context, user *model.User) serializer.Response {
+	// 用户组有效期
+	urlID := uuid.Must(uuid.NewV4())
+	if err := cache.Set(fmt.Sprintf("copy_session_%s", urlID.String()), user.ID, CopySessionTTL); err != nil {
+		return serializer.Err(serializer.CodeInternalSetting, "Failed to create copy session", err)
+	}
+
+	base := model.GetSiteURL()
+	apiBaseURI, _ := url.Parse("/api/v3/user/session/copy/" + urlID.String())
+	apiURL := base.ResolveReference(apiBaseURI)
+	res, err := auth.SignURI(auth.General, apiURL.String(), CopySessionTTL)
+	if err != nil {
+		return serializer.Err(serializer.CodeInternalSetting, "Failed to sign temp URL", err)
+	}
+
+	return serializer.Response{
+		Data: res.String(),
+	}
+}
+
+// Copy a new session from active session, refresh max-age
+func (s *CopySessionService) Copy(c *gin.Context) serializer.Response {
+	// 用户组有效期
+	cacheKey := fmt.Sprintf("copy_session_%s", s.ID)
+	uid, ok := cache.Get(cacheKey)
+	if !ok {
+		return serializer.Err(serializer.CodeNotFound, "", nil)
+	}
+
+	cache.Deletes([]string{cacheKey}, "")
+	util.SetSession(c, map[string]interface{}{
+		"user_id": uid.(uint),
+	})
+
+	return serializer.Response{}
 }

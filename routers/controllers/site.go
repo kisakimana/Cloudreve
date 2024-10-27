@@ -5,6 +5,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
+	"github.com/cloudreve/Cloudreve/v3/pkg/wopi"
 	"github.com/gin-gonic/gin"
 	"github.com/mojocn/base64Captcha"
 )
@@ -13,7 +14,6 @@ import (
 func SiteConfig(c *gin.Context) {
 	siteConfig := model.GetSettingByNames(
 		"siteName",
-		"siteICPId",
 		"login_captcha",
 		"reg_captcha",
 		"email_active",
@@ -28,23 +28,34 @@ func SiteConfig(c *gin.Context) {
 		"captcha_type",
 		"captcha_TCaptcha_CaptchaAppId",
 		"register_enabled",
+		"show_app_promotion",
 	)
+
+	var wopiExts []string
+	if wopi.Default != nil {
+		wopiExts = wopi.Default.AvailableExts()
+	}
 
 	// 如果已登录，则同时返回用户信息和标签
 	user, _ := c.Get("user")
 	if user, ok := user.(*model.User); ok {
-		c.JSON(200, serializer.BuildSiteConfig(siteConfig, user))
+		c.JSON(200, serializer.BuildSiteConfig(siteConfig, user, wopiExts))
 		return
 	}
 
-	c.JSON(200, serializer.BuildSiteConfig(siteConfig, nil))
+	c.JSON(200, serializer.BuildSiteConfig(siteConfig, nil, wopiExts))
 }
 
 // Ping 状态检查页面
 func Ping(c *gin.Context) {
+	version := conf.BackendVersion
+	if conf.IsPro == "true" {
+		version += "-pro"
+	}
+
 	c.JSON(200, serializer.Response{
 		Code: 0,
-		Data: conf.BackendVersion,
+		Data: version,
 	})
 }
 

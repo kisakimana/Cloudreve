@@ -1,25 +1,44 @@
 package cache
 
 import (
+	"encoding/gob"
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
+	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/gin-gonic/gin"
 )
+
+func init() {
+	gob.Register(map[string]itemWithTTL{})
+}
 
 // Store 缓存存储器
 var Store Driver = NewMemoStore()
 
 // Init 初始化缓存
 func Init() {
-	//Store = NewRedisStore(10, "tcp", "127.0.0.1:6379", "", "0")
-	//return
 	if conf.RedisConfig.Server != "" && gin.Mode() != gin.TestMode {
 		Store = NewRedisStore(
 			10,
 			conf.RedisConfig.Network,
 			conf.RedisConfig.Server,
+			conf.RedisConfig.User,
 			conf.RedisConfig.Password,
 			conf.RedisConfig.DB,
 		)
+	}
+}
+
+// Restore restores cache from given disk file
+func Restore(persistFile string) {
+	if err := Store.Restore(persistFile); err != nil {
+		util.Log().Warning("Failed to restore cache from disk: %s", err)
+	}
+}
+
+func InitSlaveOverwrites() {
+	err := Store.Sets(conf.OptionOverwrite, "setting_")
+	if err != nil {
+		util.Log().Warning("Failed to overwrite database setting: %s", err)
 	}
 }
 
@@ -39,6 +58,12 @@ type Driver interface {
 
 	// 删除值
 	Delete(keys []string, prefix string) error
+
+	// Save in-memory cache to disk
+	Persist(path string) error
+
+	// Restore cache from disk
+	Restore(path string) error
 }
 
 // Set 设置缓存值

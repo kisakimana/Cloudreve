@@ -3,60 +3,33 @@ package onedrive
 import (
 	"context"
 	"fmt"
-	"github.com/cloudreve/Cloudreve/v3/pkg/auth"
+	"github.com/cloudreve/Cloudreve/v3/pkg/mq"
+	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
+	"github.com/jinzhu/gorm"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
-	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/stretchr/testify/assert"
 	testMock "github.com/stretchr/testify/mock"
 )
 
 func TestDriver_Token(t *testing.T) {
 	asserts := assert.New(t)
-	handler := Driver{
-		Policy: &model.Policy{
-			AccessKey:  "ak",
-			SecretKey:  "sk",
-			BucketName: "test",
-			Server:     "test.com",
-		},
-	}
-
-	// 无法获取文件路径
-	{
-		ctx := context.WithValue(context.Background(), fsctx.FileSizeCtx, uint64(10))
-		res, err := handler.Token(ctx, 10, "key", nil)
-		asserts.Error(err)
-		asserts.Equal(serializer.UploadCredential{}, res)
-	}
-
-	// 无法获取文件大小
-	{
-		ctx := context.WithValue(context.Background(), fsctx.SavePathCtx, "/123")
-		res, err := handler.Token(ctx, 10, "key", nil)
-		asserts.Error(err)
-		asserts.Equal(serializer.UploadCredential{}, res)
-	}
-
-	// 小文件成功
-	{
-		ctx := context.WithValue(context.Background(), fsctx.SavePathCtx, "/123")
-		ctx = context.WithValue(ctx, fsctx.FileSizeCtx, uint64(10))
-		res, err := handler.Token(ctx, 10, "key", nil)
-		asserts.NoError(err)
-		asserts.Equal(serializer.UploadCredential{}, res)
-	}
+	h, _ := NewDriver(&model.Policy{
+		AccessKey:  "ak",
+		SecretKey:  "sk",
+		BucketName: "test",
+		Server:     "test.com",
+	})
+	handler := h.(Driver)
 
 	// 分片上传 失败
 	{
@@ -78,11 +51,9 @@ func TestDriver_Token(t *testing.T) {
 			},
 		})
 		handler.Client.Request = clientMock
-		ctx := context.WithValue(context.Background(), fsctx.SavePathCtx, "/123")
-		ctx = context.WithValue(ctx, fsctx.FileSizeCtx, uint64(20*1024*1024))
-		res, err := handler.Token(ctx, 10, "key", nil)
+		res, err := handler.Token(context.Background(), 10, &serializer.UploadSession{}, &fsctx.FileStream{})
 		asserts.Error(err)
-		asserts.Equal(serializer.UploadCredential{}, res)
+		asserts.Nil(res)
 	}
 
 	// 分片上传 成功
@@ -108,15 +79,13 @@ func TestDriver_Token(t *testing.T) {
 			},
 		})
 		handler.Client.Request = clientMock
-		ctx := context.WithValue(context.Background(), fsctx.SavePathCtx, "/123")
-		ctx = context.WithValue(ctx, fsctx.FileSizeCtx, uint64(20*1024*1024))
 		go func() {
 			time.Sleep(time.Duration(1) * time.Second)
-			FinishCallback("key")
+			mq.GlobalMQ.Publish("TestDriver_Token", mq.Message{})
 		}()
-		res, err := handler.Token(ctx, 10, "key", nil)
+		res, err := handler.Token(context.Background(), 10, &serializer.UploadSession{Key: "TestDriver_Token"}, &fsctx.FileStream{})
 		asserts.NoError(err)
-		asserts.Equal("123321", res.Policy)
+		asserts.Equal("123321", res.UploadURLs[0])
 	}
 }
 
@@ -136,7 +105,7 @@ func TestDriver_Source(t *testing.T) {
 
 	// 失败
 	{
-		res, err := handler.Source(context.Background(), "123.jpg", url.URL{}, 1, true, 0)
+		res, err := handler.Source(context.Background(), "123.jpg", 1, true, 0)
 		asserts.Error(err)
 		asserts.Empty(res)
 	}
@@ -146,7 +115,7 @@ func TestDriver_Source(t *testing.T) {
 		handler.Client.Credential.ExpiresIn = time.Now().Add(time.Duration(100) * time.Hour).Unix()
 		handler.Client.Credential.AccessToken = "1"
 		cache.Set("onedrive_source_0_123.jpg", "res", 1)
-		res, err := handler.Source(context.Background(), "123.jpg", url.URL{}, 0, true, 0)
+		res, err := handler.Source(context.Background(), "123.jpg", 0, true, 0)
 		cache.Deletes([]string{"0_123.jpg"}, "onedrive_source_")
 		asserts.NoError(err)
 		asserts.Equal("res", res)
@@ -161,7 +130,7 @@ func TestDriver_Source(t *testing.T) {
 		handler.Client.Credential.ExpiresIn = time.Now().Add(time.Duration(100) * time.Hour).Unix()
 		handler.Client.Credential.AccessToken = "1"
 		cache.Set(fmt.Sprintf("onedrive_source_file_%d_1", file.UpdatedAt.Unix()), "res", 0)
-		res, err := handler.Source(ctx, "123.jpg", url.URL{}, 1, true, 0)
+		res, err := handler.Source(ctx, "123.jpg", 1, true, 0)
 		cache.Deletes([]string{"0_123.jpg"}, "onedrive_source_")
 		asserts.NoError(err)
 		asserts.Equal("res", res)
@@ -186,24 +155,9 @@ func TestDriver_Source(t *testing.T) {
 		})
 		handler.Client.Request = clientMock
 		handler.Client.Credential.AccessToken = "1"
-		res, err := handler.Source(context.Background(), "123.jpg", url.URL{}, 1, true, 0)
+		res, err := handler.Source(context.Background(), "123.jpg", 1, true, 0)
 		asserts.NoError(err)
 		asserts.Equal("123321", res)
-	}
-
-	// 成功 永久直链
-	{
-		file := model.File{}
-		file.ID = 1
-		file.Name = "123.jpg"
-		file.UpdatedAt = time.Now()
-		ctx := context.WithValue(context.Background(), fsctx.FileModelCtx, file)
-		handler.Client.Credential.ExpiresIn = time.Now().Add(time.Duration(100) * time.Hour).Unix()
-		auth.General = auth.HMACAuth{}
-		handler.Client.Credential.AccessToken = "1"
-		res, err := handler.Source(ctx, "123.jpg", url.URL{}, 0, true, 0)
-		asserts.NoError(err)
-		asserts.Contains(res, "/api/v3/file/source/1/123.jpg?sign")
 	}
 }
 
@@ -291,24 +245,19 @@ func TestDriver_Thumb(t *testing.T) {
 	}
 	handler.Client, _ = NewClient(&model.Policy{})
 	handler.Client.Credential.ExpiresIn = time.Now().Add(time.Duration(100) * time.Hour).Unix()
+	file := &model.File{PicInfo: "1,1", Model: gorm.Model{ID: 1}}
 
 	// 失败
 	{
 		ctx := context.WithValue(context.Background(), fsctx.ThumbSizeCtx, [2]uint{10, 20})
-		ctx = context.WithValue(ctx, fsctx.FileModelCtx, model.File{})
-		mock.ExpectBegin()
-		mock.ExpectExec("UPDATE(.+)").WillReturnResult(sqlmock.NewResult(1, 1))
-		mock.ExpectCommit()
-		res, err := handler.Thumb(ctx, "123.jpg")
-		asserts.NoError(mock.ExpectationsWereMet())
+		res, err := handler.Thumb(ctx, file)
 		asserts.Error(err)
 		asserts.Empty(res.URL)
 	}
 
 	// 上下文错误
 	{
-		_, err := handler.Thumb(context.Background(), "123.jpg")
-		asserts.NoError(mock.ExpectationsWereMet())
+		_, err := handler.Thumb(context.Background(), file)
 		asserts.Error(err)
 	}
 }
@@ -329,7 +278,6 @@ func TestDriver_Delete(t *testing.T) {
 	// 失败
 	{
 		_, err := handler.Delete(context.Background(), []string{"1"})
-		asserts.NoError(mock.ExpectationsWereMet())
 		asserts.Error(err)
 	}
 
@@ -350,7 +298,7 @@ func TestDriver_Put(t *testing.T) {
 
 	// 失败
 	{
-		err := handler.Put(context.Background(), ioutil.NopCloser(strings.NewReader("")), "dst", 0)
+		err := handler.Put(context.Background(), &fsctx.FileStream{})
 		asserts.Error(err)
 	}
 }
@@ -417,4 +365,56 @@ func TestDriver_Get(t *testing.T) {
 	content, err := ioutil.ReadAll(res)
 	asserts.NoError(err)
 	asserts.Equal("123", string(content))
+}
+
+func TestDriver_replaceSourceHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		origin  string
+		cdn     string
+		want    string
+		wantErr bool
+	}{
+		{"TestNoReplace", "http://1dr.ms/download.aspx?123456", "", "http://1dr.ms/download.aspx?123456", false},
+		{"TestReplaceCorrect", "http://1dr.ms/download.aspx?123456", "https://test.com:8080", "https://test.com:8080/download.aspx?123456", false},
+		{"TestCdnFormatError", "http://1dr.ms/download.aspx?123456", string([]byte{0x7f}), "", true},
+		{"TestSrcFormatError", string([]byte{0x7f}), "https://test.com:8080", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &model.Policy{}
+			policy.OptionsSerialized.OdProxy = tt.cdn
+			handler := Driver{
+				Policy: policy,
+			}
+			got, err := handler.replaceSourceHost(tt.origin)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("replaceSourceHost() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("replaceSourceHost() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDriver_CancelToken(t *testing.T) {
+	asserts := assert.New(t)
+	handler := Driver{
+		Policy: &model.Policy{
+			AccessKey:  "ak",
+			SecretKey:  "sk",
+			BucketName: "test",
+			Server:     "test.com",
+		},
+	}
+	handler.Client, _ = NewClient(&model.Policy{})
+	handler.Client.Credential.ExpiresIn = time.Now().Add(time.Duration(100) * time.Hour).Unix()
+
+	// 失败
+	{
+		err := handler.CancelToken(context.Background(), &serializer.UploadSession{})
+		asserts.Error(err)
+	}
 }

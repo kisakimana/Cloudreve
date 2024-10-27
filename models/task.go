@@ -19,7 +19,7 @@ type Task struct {
 // Create 创建任务记录
 func (task *Task) Create() (uint, error) {
 	if err := DB.Create(task).Error; err != nil {
-		util.Log().Warning("无法插入任务记录, %s", err)
+		util.Log().Warning("Failed to insert task record: %s", err)
 		return 0, err
 	}
 	return task.ID, nil
@@ -64,7 +64,7 @@ func ListTasks(uid uint, page, pageSize int, order string) ([]Task, int) {
 	dbChain = dbChain.Where("user_id = ?", uid)
 
 	// 计算总数用于分页
-	dbChain.Model(&Share{}).Count(&total)
+	dbChain.Model(&Task{}).Count(&total)
 
 	// 查询记录
 	dbChain.Limit(pageSize).Offset((page - 1) * pageSize).Order(order).Find(&tasks)

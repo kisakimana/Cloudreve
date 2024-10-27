@@ -1,8 +1,12 @@
 package cluster
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
+	"github.com/cloudreve/Cloudreve/v3/pkg/mocks/requestmock"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/stretchr/testify/assert"
@@ -439,5 +443,117 @@ func TestSlaveCaller_DeleteTempFile(t *testing.T) {
 		m.caller.Client = mockRequest
 		err := m.caller.DeleteTempFile(&model.Download{})
 		a.NoError(err)
+	}
+}
+
+func TestRemoteCallback(t *testing.T) {
+	asserts := assert.New(t)
+
+	// 回调成功
+	{
+		clientMock := requestmock.RequestMock{}
+		mockResp, _ := json.Marshal(serializer.Response{Code: 0})
+		clientMock.On(
+			"Request",
+			"POST",
+			"http://test/test/url",
+			testMock.Anything,
+			testMock.Anything,
+		).Return(&request.Response{
+			Err: nil,
+			Response: &http.Response{
+				StatusCode: 200,
+				Body:       ioutil.NopCloser(bytes.NewReader(mockResp)),
+			},
+		})
+		request.GeneralClient = clientMock
+		resp := RemoteCallback("http://test/test/url", serializer.UploadCallback{})
+		asserts.NoError(resp)
+		clientMock.AssertExpectations(t)
+	}
+
+	// 服务端返回业务错误
+	{
+		clientMock := requestmock.RequestMock{}
+		mockResp, _ := json.Marshal(serializer.Response{Code: 401})
+		clientMock.On(
+			"Request",
+			"POST",
+			"http://test/test/url",
+			testMock.Anything,
+			testMock.Anything,
+		).Return(&request.Response{
+			Err: nil,
+			Response: &http.Response{
+				StatusCode: 200,
+				Body:       ioutil.NopCloser(bytes.NewReader(mockResp)),
+			},
+		})
+		request.GeneralClient = clientMock
+		resp := RemoteCallback("http://test/test/url", serializer.UploadCallback{})
+		asserts.EqualValues(401, resp.(serializer.AppError).Code)
+		clientMock.AssertExpectations(t)
+	}
+
+	// 无法解析回调响应
+	{
+		clientMock := requestmock.RequestMock{}
+		clientMock.On(
+			"Request",
+			"POST",
+			"http://test/test/url",
+			testMock.Anything,
+			testMock.Anything,
+		).Return(&request.Response{
+			Err: nil,
+			Response: &http.Response{
+				StatusCode: 200,
+				Body:       ioutil.NopCloser(strings.NewReader("mockResp")),
+			},
+		})
+		request.GeneralClient = clientMock
+		resp := RemoteCallback("http://test/test/url", serializer.UploadCallback{})
+		asserts.Error(resp)
+		clientMock.AssertExpectations(t)
+	}
+
+	// HTTP状态码非200
+	{
+		clientMock := requestmock.RequestMock{}
+		clientMock.On(
+			"Request",
+			"POST",
+			"http://test/test/url",
+			testMock.Anything,
+			testMock.Anything,
+		).Return(&request.Response{
+			Err: nil,
+			Response: &http.Response{
+				StatusCode: 404,
+				Body:       ioutil.NopCloser(strings.NewReader("mockResp")),
+			},
+		})
+		request.GeneralClient = clientMock
+		resp := RemoteCallback("http://test/test/url", serializer.UploadCallback{})
+		asserts.Error(resp)
+		clientMock.AssertExpectations(t)
+	}
+
+	// 无法发起回调
+	{
+		clientMock := requestmock.RequestMock{}
+		clientMock.On(
+			"Request",
+			"POST",
+			"http://test/test/url",
+			testMock.Anything,
+			testMock.Anything,
+		).Return(&request.Response{
+			Err: errors.New("error"),
+		})
+		request.GeneralClient = clientMock
+		resp := RemoteCallback("http://test/test/url", serializer.UploadCallback{})
+		asserts.Error(resp)
+		clientMock.AssertExpectations(t)
 	}
 }

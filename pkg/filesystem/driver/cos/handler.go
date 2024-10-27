@@ -17,10 +17,12 @@ import (
 	"time"
 
 	model "github.com/cloudreve/Cloudreve/v3/models"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/response"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
+	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/google/go-querystring/query"
 	cossdk "github.com/tencentyun/cos-go-sdk-v5"
 )
@@ -148,14 +150,7 @@ func (handler Driver) CORS() error {
 // Get 获取文件
 func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, error) {
 	// 获取文件源地址
-	downloadURL, err := handler.Source(
-		ctx,
-		path,
-		url.URL{},
-		int64(model.GetIntSetting("preview_timeout", 60)),
-		false,
-		0,
-	)
+	downloadURL, err := handler.Source(ctx, path, int64(model.GetIntSetting("preview_timeout", 60)), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -218,23 +213,37 @@ func (handler Driver) Delete(ctx context.Context, files []string) ([]string, err
 		return failed, nil
 	}
 
-	return failed, errors.New("删除失败")
+	return failed, errors.New("delete failed")
 }
 
 // Thumb 获取文件缩略图
-func (handler Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
+func (handler Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
+	// quick check by extension name
+	// https://cloud.tencent.com/document/product/436/44893
+	supported := []string{"png", "jpg", "jpeg", "gif", "bmp", "webp", "heif", "heic"}
+	if len(handler.Policy.OptionsSerialized.ThumbExts) > 0 {
+		supported = handler.Policy.OptionsSerialized.ThumbExts
+	}
+
+	if !util.IsInExtensionList(supported, file.Name) || file.Size > (32<<(10*2)) {
+		return nil, driver.ErrorThumbNotSupported
+	}
+
 	var (
 		thumbSize = [2]uint{400, 300}
 		ok        = false
 	)
 	if thumbSize, ok = ctx.Value(fsctx.ThumbSizeCtx).([2]uint); !ok {
-		return nil, errors.New("无法获取缩略图尺寸设置")
+		return nil, errors.New("failed to get thumbnail size")
 	}
-	thumbParam := fmt.Sprintf("imageMogr2/thumbnail/%dx%d", thumbSize[0], thumbSize[1])
+
+	thumbEncodeQuality := model.GetIntSetting("thumb_encode_quality", 85)
+
+	thumbParam := fmt.Sprintf("imageMogr2/thumbnail/%dx%d/quality/%d", thumbSize[0], thumbSize[1], thumbEncodeQuality)
 
 	source, err := handler.signSourceURL(
 		ctx,
-		path,
+		file.SourceName,
 		int64(model.GetIntSetting("preview_timeout", 60)),
 		&urlOption{},
 	)
@@ -254,14 +263,7 @@ func (handler Driver) Thumb(ctx context.Context, path string) (*response.Content
 }
 
 // Source 获取外链URL
-func (handler Driver) Source(
-	ctx context.Context,
-	path string,
-	baseURL url.URL,
-	ttl int64,
-	isDownload bool,
-	speed int,
-) (string, error) {
+func (handler Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 	// 尝试从上下文获取文件名
 	fileName := ""
 	if file, ok := ctx.Value(fsctx.FileModelCtx).(model.File); ok {
@@ -357,8 +359,9 @@ func (handler Driver) Token(ctx context.Context, ttl int64, uploadSession *seria
 
 	res, err := handler.getUploadCredential(ctx, postPolicy, keyTime, savePath)
 	if err == nil {
+		res.SessionID = uploadSession.Key
 		res.Callback = apiURL
-		res.Key = uploadSession.Key
+		res.UploadURLs = []string{handler.Policy.Server}
 	}
 
 	return res, err
@@ -415,10 +418,10 @@ func (handler Driver) getUploadCredential(ctx context.Context, policy UploadPoli
 	signature := hmacFinalSign.Sum(nil)
 
 	return &serializer.UploadCredential{
-		Policy:    policyEncoded,
-		Path:      savePath,
-		AccessKey: handler.Policy.AccessKey,
-		Token:     fmt.Sprintf("%x", signature),
-		KeyTime:   keyTime,
+		Policy:     policyEncoded,
+		Path:       savePath,
+		AccessKey:  handler.Policy.AccessKey,
+		Credential: fmt.Sprintf("%x", signature),
+		KeyTime:    keyTime,
 	}, nil
 }

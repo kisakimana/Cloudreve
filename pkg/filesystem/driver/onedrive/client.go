@@ -10,13 +10,15 @@ import (
 
 var (
 	// ErrAuthEndpoint 无法解析授权端点地址
-	ErrAuthEndpoint = errors.New("无法解析授权端点地址")
+	ErrAuthEndpoint = errors.New("failed to parse endpoint url")
 	// ErrInvalidRefreshToken 上传策略无有效的RefreshToken
-	ErrInvalidRefreshToken = errors.New("上传策略无有效的RefreshToken")
+	ErrInvalidRefreshToken = errors.New("no valid refresh token in this policy")
 	// ErrDeleteFile 无法删除文件
-	ErrDeleteFile = errors.New("无法删除文件")
+	ErrDeleteFile = errors.New("cannot delete file")
 	// ErrClientCanceled 客户端取消操作
-	ErrClientCanceled = errors.New("客户端取消操作")
+	ErrClientCanceled = errors.New("client canceled")
+	// Desired thumb size not available
+	ErrThumbSizeNotFound = errors.New("thumb size not found")
 )
 
 // Client OneDrive客户端
@@ -56,7 +58,7 @@ func NewClient(policy *model.Policy) (*Client, error) {
 		Policy:            policy,
 		ClientID:          policy.BucketName,
 		ClientSecret:      policy.SecretKey,
-		Redirect:          policy.OptionsSerialized.OdRedirect,
+		Redirect:          policy.OptionsSerialized.OauthRedirect,
 		Request:           request.NewClient(),
 		ClusterController: cluster.DefaultController,
 	}

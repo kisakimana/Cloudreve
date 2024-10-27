@@ -23,6 +23,11 @@ func IsTrueVal(val string) bool {
 
 // GetSettingByName 用 Name 获取设置值
 func GetSettingByName(name string) string {
+	return GetSettingByNameFromTx(DB, name)
+}
+
+// GetSettingByNameFromTx 用 Name 获取设置值，使用事务
+func GetSettingByNameFromTx(tx *gorm.DB, name string) string {
 	var setting Setting
 
 	// 优先从缓存中查找
@@ -32,15 +37,29 @@ func GetSettingByName(name string) string {
 	}
 
 	// 尝试数据库中查找
-	if DB != nil {
-		result := DB.Where("name = ?", name).First(&setting)
-		if result.Error == nil {
-			_ = cache.Set(cacheKey, setting.Value, -1)
-			return setting.Value
+	if tx == nil {
+		tx = DB
+		if tx == nil {
+			return ""
 		}
 	}
 
+	result := tx.Where("name = ?", name).First(&setting)
+	if result.Error == nil {
+		_ = cache.Set(cacheKey, setting.Value, -1)
+		return setting.Value
+	}
+
 	return ""
+}
+
+// GetSettingByNameWithDefault 用 Name 获取设置值, 取不到时使用缺省值
+func GetSettingByNameWithDefault(name, fallback string) string {
+	res := GetSettingByName(name)
+	if res == "" {
+		return fallback
+	}
+	return res
 }
 
 // GetSettingByNames 用多个 Name 获取设置值

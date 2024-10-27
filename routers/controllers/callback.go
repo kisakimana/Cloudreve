@@ -57,7 +57,7 @@ func UpyunCallback(c *gin.Context) {
 	if err := c.ShouldBind(&callbackBody); err == nil {
 		if callbackBody.Code != 200 {
 			util.Log().Debug(
-				"又拍云回调返回错误代码%d，信息：%s",
+				"Upload callback returned error code:%d, message: %s",
 				callbackBody.Code,
 				callbackBody.Message,
 			)
@@ -83,9 +83,27 @@ func OneDriveCallback(c *gin.Context) {
 
 // OneDriveOAuth OneDrive 授权回调
 func OneDriveOAuth(c *gin.Context) {
-	var callbackBody callback.OneDriveOauthService
+	var callbackBody callback.OauthService
 	if err := c.ShouldBindQuery(&callbackBody); err == nil {
-		res := callbackBody.Auth(c)
+		res := callbackBody.OdAuth(c)
+		redirect := model.GetSiteURL()
+		redirect.Path = path.Join(redirect.Path, "/admin/policy")
+		queries := redirect.Query()
+		queries.Add("code", strconv.Itoa(res.Code))
+		queries.Add("msg", res.Msg)
+		queries.Add("err", res.Error)
+		redirect.RawQuery = queries.Encode()
+		c.Redirect(303, redirect.String())
+	} else {
+		c.JSON(200, ErrorResponse(err))
+	}
+}
+
+// GoogleDriveOAuth Google Drive 授权回调
+func GoogleDriveOAuth(c *gin.Context) {
+	var callbackBody callback.OauthService
+	if err := c.ShouldBindQuery(&callbackBody); err == nil {
+		res := callbackBody.GDriveAuth(c)
 		redirect := model.GetSiteURL()
 		redirect.Path = path.Join(redirect.Path, "/admin/policy")
 		queries := redirect.Query()
@@ -112,7 +130,6 @@ func COSCallback(c *gin.Context) {
 
 // S3Callback S3上传完成客户端回调
 func S3Callback(c *gin.Context) {
-	c.Header("Access-Control-Allow-Origin", "*")
 	var callbackBody callback.S3Callback
 	if err := c.ShouldBindQuery(&callbackBody); err == nil {
 		res := callbackBody.PreProcess(c)

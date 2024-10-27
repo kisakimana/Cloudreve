@@ -2,8 +2,6 @@ package controllers
 
 import (
 	"context"
-	"net/url"
-	"strconv"
 
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
@@ -28,77 +26,6 @@ func SlaveUpload(c *gin.Context) {
 	} else {
 		c.JSON(200, ErrorResponse(err))
 	}
-
-	//// 创建上下文
-	//ctx, cancel := context.WithCancel(context.Background())
-	//ctx = context.WithValue(ctx, fsctx.GinCtx, c)
-	//defer cancel()
-	//
-	//// 创建匿名文件系统
-	//fs, err := filesystem.NewAnonymousFileSystem()
-	//if err != nil {
-	//	c.JSON(200, serializer.Err(serializer.CodePolicyNotAllowed, err.Error(), err))
-	//	return
-	//}
-	//fs.Handler = local.Driver{}
-	//
-	//// 从请求中取得上传策略
-	//uploadPolicyRaw := c.GetHeader("X-Cr-Policy")
-	//if uploadPolicyRaw == "" {
-	//	c.JSON(200, serializer.ParamErr("未指定上传策略", nil))
-	//	return
-	//}
-	//
-	//// 解析上传策略
-	//uploadPolicy, err := serializer.DecodeUploadPolicy(uploadPolicyRaw)
-	//if err != nil {
-	//	c.JSON(200, serializer.ParamErr("上传策略格式有误", err))
-	//	return
-	//}
-	//ctx = context.WithValue(ctx, fsctx.UploadPolicyCtx, *uploadPolicy)
-	//
-	//// 取得文件大小
-	//fileSize, err := strconv.ParseUint(c.Request.Header.Get("Content-Length"), 10, 64)
-	//if err != nil {
-	//	c.JSON(200, ErrorResponse(err))
-	//	return
-	//}
-	//
-	//// 解码文件名和路径
-	//fileName, err := url.QueryUnescape(c.Request.Header.Get("X-Cr-FileName"))
-	//if err != nil {
-	//	c.JSON(200, ErrorResponse(err))
-	//	return
-	//}
-	//
-	//fileData := fsctx.FileStream{
-	//	MIMEType: c.Request.Header.Get("Content-Type"),
-	//	File:     c.Request.Body,
-	//	Name:     fileName,
-	//	Size:     fileSize,
-	//}
-	//
-	//// 给文件系统分配钩子
-	//fs.Use("BeforeUpload", filesystem.HookSlaveUploadValidate)
-	//fs.Use("AfterUploadCanceled", filesystem.HookDeleteTempFile)
-	//fs.Use("AfterUpload", filesystem.SlaveAfterUpload)
-	//fs.Use("AfterValidateFailed", filesystem.HookDeleteTempFile)
-	//
-	////// 是否允许覆盖
-	////if c.Request.Header.Get("X-Cr-Overwrite") == "false" {
-	////	fileData.Mode = fsctx.Create
-	////}
-	//
-	//// 执行上传
-	//err = fs.LocalUpload(ctx, &fileData)
-	//if err != nil {
-	//	c.JSON(200, serializer.Err(serializer.CodeUploadFailed, err.Error(), err))
-	//	return
-	//}
-	//
-	//c.JSON(200, serializer.Response{
-	//	Code: 0,
-	//})
 }
 
 // SlaveGetUploadSession 从机创建上传会话
@@ -110,6 +37,21 @@ func SlaveGetUploadSession(c *gin.Context) {
 	var service explorer.SlaveCreateUploadSessionService
 	if err := c.ShouldBindJSON(&service); err == nil {
 		res := service.Create(ctx, c)
+		c.JSON(200, res)
+	} else {
+		c.JSON(200, ErrorResponse(err))
+	}
+}
+
+// SlaveDeleteUploadSession 从机删除上传会话
+func SlaveDeleteUploadSession(c *gin.Context) {
+	// 创建上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var service explorer.UploadSessionService
+	if err := c.ShouldBindUri(&service); err == nil {
+		res := service.SlaveDelete(ctx, c)
 		c.JSON(200, res)
 	} else {
 		c.JSON(200, ErrorResponse(err))
@@ -281,9 +223,9 @@ func SlaveNotificationPush(c *gin.Context) {
 	}
 }
 
-// SlaveGetOneDriveCredential 从机获取主机的OneDrive存储策略凭证
-func SlaveGetOneDriveCredential(c *gin.Context) {
-	var service node.OneDriveCredentialService
+// SlaveGetOauthCredential 从机获取主机的OneDrive存储策略凭证
+func SlaveGetOauthCredential(c *gin.Context) {
+	var service node.OauthCredentialService
 	if err := c.ShouldBindUri(&service); err == nil {
 		res := service.Get(c)
 		c.JSON(200, res)

@@ -25,7 +25,7 @@ func TestGetPolicyByID(t *testing.T) {
 		asserts.NoError(err)
 		asserts.NoError(mock.ExpectationsWereMet())
 		asserts.Equal("默认存储策略", policy.Name)
-		asserts.Equal("123", policy.OptionsSerialized.OdRedirect)
+		asserts.Equal("123", policy.OptionsSerialized.OauthRedirect)
 
 		rows = sqlmock.NewRows([]string{"name", "type", "options"})
 		mock.ExpectQuery("^SELECT(.+)").WillReturnRows(rows)
@@ -39,7 +39,7 @@ func TestGetPolicyByID(t *testing.T) {
 		policy, err := GetPolicyByID(uint(22))
 		asserts.NoError(err)
 		asserts.Equal("默认存储策略", policy.Name)
-		asserts.Equal("123", policy.OptionsSerialized.OdRedirect)
+		asserts.Equal("123", policy.OptionsSerialized.OauthRedirect)
 
 	}
 
@@ -50,7 +50,7 @@ func TestPolicy_BeforeSave(t *testing.T) {
 
 	testPolicy := Policy{
 		OptionsSerialized: PolicyOption{
-			OdRedirect: "123",
+			OauthRedirect: "123",
 		},
 	}
 	expected, _ := json.Marshal(testPolicy.OptionsSerialized)
@@ -104,7 +104,7 @@ func TestPolicy_GenerateFileName(t *testing.T) {
 		asserts.Equal("123.txt", testPolicy.GenerateFileName(1, "123.txt"))
 
 		testPolicy.Type = "oss"
-		asserts.Equal("${filename}", testPolicy.GenerateFileName(1, ""))
+		asserts.Equal("origin", testPolicy.GenerateFileName(1, "origin"))
 	}
 
 	// 重命名开启
@@ -134,6 +134,12 @@ func TestPolicy_GenerateFileName(t *testing.T) {
 		testPolicy.FileNameRule = "123{date}ss{datetime}"
 		asserts.Len(testPolicy.GenerateFileName(1, "123.txt"), 27)
 
+		testPolicy.FileNameRule = "{originname_without_ext}"
+		asserts.Len(testPolicy.GenerateFileName(1, "123.txt"), 3)
+
+		testPolicy.FileNameRule = "{originname_without_ext}_{randomkey8}{ext}"
+		asserts.Len(testPolicy.GenerateFileName(1, "123.txt"), 16)
+
 		// 支持{originname}的策略
 		testPolicy.Type = "local"
 		testPolicy.FileNameRule = "123{originname}"
@@ -145,19 +151,23 @@ func TestPolicy_GenerateFileName(t *testing.T) {
 
 		testPolicy.Type = "oss"
 		testPolicy.FileNameRule = "{uid}123{originname}"
-		asserts.Equal("1123${filename}", testPolicy.GenerateFileName(1, ""))
+		asserts.Equal("1123123321", testPolicy.GenerateFileName(1, "123321"))
 
 		testPolicy.Type = "upyun"
 		testPolicy.FileNameRule = "{uid}123{originname}"
-		asserts.Equal("1123{filename}{.suffix}", testPolicy.GenerateFileName(1, ""))
+		asserts.Equal("1123123321", testPolicy.GenerateFileName(1, "123321"))
 
 		testPolicy.Type = "qiniu"
 		testPolicy.FileNameRule = "{uid}123{originname}"
-		asserts.Equal("1123$(fname)", testPolicy.GenerateFileName(1, ""))
+		asserts.Equal("1123123321", testPolicy.GenerateFileName(1, "123321"))
 
 		testPolicy.Type = "local"
 		testPolicy.FileNameRule = "{uid}123{originname}"
 		asserts.Equal("1123", testPolicy.GenerateFileName(1, ""))
+
+		testPolicy.Type = "local"
+		testPolicy.FileNameRule = "{ext}123{uuid}"
+		asserts.Contains(testPolicy.GenerateFileName(1, "123.txt"), ".txt123")
 	}
 
 }
@@ -168,78 +178,6 @@ func TestPolicy_IsDirectlyPreview(t *testing.T) {
 	asserts.True(policy.IsDirectlyPreview())
 	policy.Type = "remote"
 	asserts.False(policy.IsDirectlyPreview())
-}
-
-func TestPolicy_GetUploadURL(t *testing.T) {
-	asserts := assert.New(t)
-
-	// 本地
-	{
-		cache.Set("setting_siteURL", "http://127.0.0.1", 0)
-		policy := Policy{Type: "local", Server: "http://127.0.0.1"}
-		asserts.Equal("/api/v3/file/upload", policy.GetUploadURL())
-	}
-
-	// 远程
-	{
-		policy := Policy{Type: "remote", Server: "http://127.0.0.1"}
-		asserts.Equal("http://127.0.0.1/api/v3/slave/upload", policy.GetUploadURL())
-	}
-
-	// OSS
-	{
-		policy := Policy{Type: "oss", BucketName: "base", Server: "127.0.0.1"}
-		asserts.Equal("https://base.127.0.0.1", policy.GetUploadURL())
-	}
-
-	// cos
-	{
-		policy := Policy{Type: "cos", BaseURL: "base", Server: "http://127.0.0.1"}
-		asserts.Equal("http://127.0.0.1", policy.GetUploadURL())
-	}
-
-	// upyun
-	{
-		policy := Policy{Type: "upyun", BucketName: "base", Server: "http://127.0.0.1"}
-		asserts.Equal("https://v0.api.upyun.com/base", policy.GetUploadURL())
-	}
-
-	// 未知
-	{
-		policy := Policy{Type: "unknown", Server: "http://127.0.0.1"}
-		asserts.Equal("http://127.0.0.1", policy.GetUploadURL())
-	}
-
-	// S3 未填写自动生成
-	{
-		policy := Policy{
-			Type:              "s3",
-			Server:            "",
-			BucketName:        "bucket",
-			OptionsSerialized: PolicyOption{Region: "us-east"},
-		}
-		asserts.Equal("https://bucket.s3.us-east.amazonaws.com/", policy.GetUploadURL())
-	}
-
-	// s3 自己指定
-	{
-		policy := Policy{
-			Type:              "s3",
-			Server:            "https://s3.us-east.amazonaws.com/",
-			BucketName:        "bucket",
-			OptionsSerialized: PolicyOption{Region: "us-east"},
-		}
-		asserts.Equal("https://s3.us-east.amazonaws.com/bucket", policy.GetUploadURL())
-	}
-
-}
-
-func TestPolicy_IsPathGenerateNeeded(t *testing.T) {
-	asserts := assert.New(t)
-	policy := Policy{Type: "qiniu"}
-	asserts.True(policy.IsPathGenerateNeeded())
-	policy.Type = "remote"
-	asserts.False(policy.IsPathGenerateNeeded())
 }
 
 func TestPolicy_ClearCache(t *testing.T) {
@@ -266,66 +204,18 @@ func TestPolicy_UpdateAccessKey(t *testing.T) {
 func TestPolicy_Props(t *testing.T) {
 	asserts := assert.New(t)
 	policy := Policy{Type: "onedrive"}
+	policy.OptionsSerialized.PlaceholderWithSize = true
 	asserts.False(policy.IsThumbGenerateNeeded())
-	asserts.True(policy.IsPathGenerateNeeded())
-	asserts.True(policy.IsTransitUpload(4))
+	asserts.False(policy.IsTransitUpload(4))
 	asserts.False(policy.IsTransitUpload(5 * 1024 * 1024))
 	asserts.True(policy.CanStructureBeListed())
+	asserts.True(policy.IsUploadPlaceholderWithSize())
 	policy.Type = "local"
 	asserts.True(policy.IsThumbGenerateNeeded())
-	asserts.True(policy.IsPathGenerateNeeded())
 	asserts.False(policy.CanStructureBeListed())
-}
-
-func TestPolicy_IsThumbExist(t *testing.T) {
-	asserts := assert.New(t)
-
-	testCases := []struct {
-		name   string
-		expect bool
-		policy string
-	}{
-		{
-			"1.png",
-			false,
-			"unknown",
-		},
-		{
-			"1.png",
-			false,
-			"local",
-		},
-		{
-			"1.png",
-			true,
-			"cos",
-		},
-		{
-			"1",
-			false,
-			"cos",
-		},
-		{
-			"1.txt.png",
-			true,
-			"cos",
-		},
-		{
-			"1.png.txt",
-			false,
-			"cos",
-		},
-		{
-			"1",
-			true,
-			"onedrive",
-		},
-	}
-
-	for _, testCase := range testCases {
-		policy := Policy{Type: testCase.policy}
-		asserts.Equal(testCase.expect, policy.IsThumbExist(testCase.name))
-	}
+	asserts.False(policy.IsUploadPlaceholderWithSize())
+	policy.Type = "remote"
+	asserts.True(policy.IsUploadPlaceholderWithSize())
 }
 
 func TestPolicy_UpdateAccessKeyAndClearCache(t *testing.T) {
@@ -341,4 +231,39 @@ func TestPolicy_UpdateAccessKeyAndClearCache(t *testing.T) {
 	a.NoError(mock.ExpectationsWereMet())
 	_, ok := cache.Get("policy_1331")
 	a.False(ok)
+}
+
+func TestPolicy_CouldProxyThumb(t *testing.T) {
+	a := assert.New(t)
+	p := &Policy{Type: "local"}
+
+	// local policy
+	{
+		a.False(p.CouldProxyThumb())
+	}
+
+	// feature not enabled
+	{
+		p.Type = "remote"
+		cache.Set("setting_thumb_proxy_enabled", "0", 0)
+		a.False(p.CouldProxyThumb())
+	}
+
+	// list not contain current policy
+	{
+		p.ID = 2
+		cache.Set("setting_thumb_proxy_enabled", "1", 0)
+		cache.Set("setting_thumb_proxy_policy", "[1]", 0)
+		a.False(p.CouldProxyThumb())
+	}
+
+	// enabled
+	{
+		p.ID = 2
+		cache.Set("setting_thumb_proxy_enabled", "1", 0)
+		cache.Set("setting_thumb_proxy_policy", "[2]", 0)
+		a.True(p.CouldProxyThumb())
+	}
+
+	cache.Deletes([]string{"thumb_proxy_enabled", "thumb_proxy_policy"}, "setting_")
 }

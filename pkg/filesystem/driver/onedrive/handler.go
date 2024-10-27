@@ -11,7 +11,6 @@ import (
 	"time"
 
 	model "github.com/cloudreve/Cloudreve/v3/models"
-	"github.com/cloudreve/Cloudreve/v3/pkg/auth"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
@@ -30,6 +29,10 @@ type Driver struct {
 // NewDriver 从存储策略初始化新的Driver实例
 func NewDriver(policy *model.Policy) (driver.Handler, error) {
 	client, err := NewClient(policy)
+	if policy.OptionsSerialized.ChunkSize == 0 {
+		policy.OptionsSerialized.ChunkSize = 50 << 20 // 50MB
+	}
+
 	return Driver{
 		Policy:     policy,
 		Client:     client,
@@ -88,7 +91,6 @@ func (handler Driver) Get(ctx context.Context, path string) (response.RSCloser, 
 	downloadURL, err := handler.Source(
 		ctx,
 		path,
-		url.URL{},
 		60,
 		false,
 		0,
@@ -133,22 +135,24 @@ func (handler Driver) Delete(ctx context.Context, files []string) ([]string, err
 }
 
 // Thumb 获取文件缩略图
-func (handler Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
+func (handler Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
 	var (
 		thumbSize = [2]uint{400, 300}
 		ok        = false
 	)
 	if thumbSize, ok = ctx.Value(fsctx.ThumbSizeCtx).([2]uint); !ok {
-		return nil, errors.New("无法获取缩略图尺寸设置")
+		return nil, errors.New("failed to get thumbnail size")
 	}
 
-	res, err := handler.Client.GetThumbURL(ctx, path, thumbSize[0], thumbSize[1])
+	res, err := handler.Client.GetThumbURL(ctx, file.SourceName, thumbSize[0], thumbSize[1])
 	if err != nil {
-		// 如果出现异常，就清空文件的pic_info
-		if file, ok := ctx.Value(fsctx.FileModelCtx).(model.File); ok {
-			file.UpdatePicInfo("")
+		var apiErr *RespError
+		if errors.As(err, &apiErr); err == ErrThumbSizeNotFound || (apiErr != nil && apiErr.APIError.Code == notFoundError) {
+			// OneDrive cannot generate thumbnail for this file
+			return nil, driver.ErrorThumbNotSupported
 		}
 	}
+
 	return &response.ContentResponse{
 		Redirect: true,
 		URL:      res,
@@ -159,7 +163,6 @@ func (handler Driver) Thumb(ctx context.Context, path string) (*response.Content
 func (handler Driver) Source(
 	ctx context.Context,
 	path string,
-	baseURL url.URL,
 	ttl int64,
 	isDownload bool,
 	speed int,
@@ -167,19 +170,6 @@ func (handler Driver) Source(
 	cacheKey := fmt.Sprintf("onedrive_source_%d_%s", handler.Policy.ID, path)
 	if file, ok := ctx.Value(fsctx.FileModelCtx).(model.File); ok {
 		cacheKey = fmt.Sprintf("onedrive_source_file_%d_%d", file.UpdatedAt.Unix(), file.ID)
-		// 如果是永久链接，则返回签名后的中转外链
-		if ttl == 0 {
-			signedURI, err := auth.SignURI(
-				auth.General,
-				fmt.Sprintf("/api/v3/file/source/%d/%s", file.ID, file.Name),
-				ttl,
-			)
-			if err != nil {
-				return "", err
-			}
-			return baseURL.ResolveReference(signedURI).String(), nil
-		}
-
 	}
 
 	// 尝试从缓存中查找
@@ -226,16 +216,6 @@ func (handler Driver) replaceSourceHost(origin string) (string, error) {
 func (handler Driver) Token(ctx context.Context, ttl int64, uploadSession *serializer.UploadSession, file fsctx.FileHeader) (*serializer.UploadCredential, error) {
 	fileInfo := file.Info()
 
-	// 如果小于4MB，则由服务端中转
-	if fileInfo.Size <= SmallFileSize {
-		return nil, nil
-	}
-
-	// 生成回调地址
-	siteURL := model.GetSiteURL()
-	apiBaseURI, _ := url.Parse("/api/v3/callback/onedrive/finish/" + uploadSession.Key)
-	apiURL := siteURL.ResolveReference(apiBaseURI)
-
 	uploadURL, err := handler.Client.CreateUploadSession(ctx, fileInfo.SavePath, WithConflictBehavior("fail"))
 	if err != nil {
 		return nil, err
@@ -244,13 +224,15 @@ func (handler Driver) Token(ctx context.Context, ttl int64, uploadSession *seria
 	// 监控回调及上传
 	go handler.Client.MonitorUpload(uploadURL, uploadSession.Key, fileInfo.SavePath, fileInfo.Size, ttl)
 
+	uploadSession.UploadURL = uploadURL
 	return &serializer.UploadCredential{
-		Policy: uploadURL,
-		Token:  apiURL.String(),
+		SessionID:  uploadSession.Key,
+		ChunkSize:  handler.Policy.OptionsSerialized.ChunkSize,
+		UploadURLs: []string{uploadURL},
 	}, nil
 }
 
 // 取消上传凭证
 func (handler Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
-	return nil
+	return handler.Client.DeleteUploadSession(ctx, uploadSession.UploadURL)
 }

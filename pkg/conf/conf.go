@@ -3,7 +3,7 @@ package conf
 import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/go-ini/ini"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/go-playground/validator/v10"
 )
 
 // database 数据库
@@ -17,6 +17,7 @@ type database struct {
 	DBFile      string
 	Port        int
 	Charset     string
+	UnixSocket  bool
 }
 
 // system 系统通用配置
@@ -26,6 +27,8 @@ type system struct {
 	Debug         bool
 	SessionSecret string
 	HashIDSalt    string
+	GracePeriod   int    `validate:"gte=0"`
+	ProxyHeader   string `validate:"required_with=Listen"`
 }
 
 type ssl struct {
@@ -36,6 +39,7 @@ type ssl struct {
 
 type unix struct {
 	Listen string
+	Perm   uint32
 }
 
 // slave 作为slave存储端配置
@@ -45,38 +49,13 @@ type slave struct {
 	SignatureTTL    int    `validate:"omitempty,gte=1"`
 }
 
-// captcha 验证码配置
-type captcha struct {
-	Height             int `validate:"gte=0"`
-	Width              int `validate:"gte=0"`
-	Mode               int `validate:"gte=0,lte=3"`
-	ComplexOfNoiseText int `validate:"gte=0,lte=2"`
-	ComplexOfNoiseDot  int `validate:"gte=0,lte=2"`
-	IsShowHollowLine   bool
-	IsShowNoiseDot     bool
-	IsShowNoiseText    bool
-	IsShowSlimeLine    bool
-	IsShowSineLine     bool
-	CaptchaLen         int `validate:"gt=0"`
-}
-
 // redis 配置
 type redis struct {
 	Network  string
 	Server   string
+	User	 string
 	Password string
 	DB       string
-}
-
-// 缩略图 配置
-type thumb struct {
-	MaxWidth      uint
-	MaxHeight     uint
-	FileSuffix    string `validate:"min=1"`
-	MaxTaskCount  int
-	EncodeMethod  string `validate:"eq=jpg|eq=png"`
-	EncodeQuality int    `validate:"gte=1,lte=100"`
-	GCAfterGen    bool
 }
 
 // 跨域配置
@@ -86,11 +65,14 @@ type cors struct {
 	AllowHeaders     []string
 	AllowCredentials bool
 	ExposeHeaders    []string
+	SameSite         string
+	Secure           bool
 }
 
 var cfg *ini.File
 
 const defaultConf = `[System]
+Debug = false
 Mode = master
 Listen = :5212
 SessionSecret = {SessionSecret}
@@ -109,13 +91,13 @@ func Init(path string) {
 		}, defaultConf)
 		f, err := util.CreatNestedFile(path)
 		if err != nil {
-			util.Log().Panic("无法创建配置文件, %s", err)
+			util.Log().Panic("Failed to create config file: %s", err)
 		}
 
 		// 写入配置文件
 		_, err = f.WriteString(confContent)
 		if err != nil {
-			util.Log().Panic("无法写入配置文件, %s", err)
+			util.Log().Panic("Failed to write config file: %s", err)
 		}
 
 		f.Close()
@@ -123,7 +105,7 @@ func Init(path string) {
 
 	cfg, err = ini.Load(path)
 	if err != nil {
-		util.Log().Panic("无法解析配置文件 '%s': %s", path, err)
+		util.Log().Panic("Failed to parse config file %q: %s", path, err)
 	}
 
 	sections := map[string]interface{}{
@@ -131,17 +113,20 @@ func Init(path string) {
 		"System":     SystemConfig,
 		"SSL":        SSLConfig,
 		"UnixSocket": UnixConfig,
-		"Captcha":    CaptchaConfig,
 		"Redis":      RedisConfig,
-		"Thumbnail":  ThumbConfig,
 		"CORS":       CORSConfig,
 		"Slave":      SlaveConfig,
 	}
 	for sectionName, sectionStruct := range sections {
 		err = mapSection(sectionName, sectionStruct)
 		if err != nil {
-			util.Log().Panic("配置文件 %s 分区解析失败: %s", sectionName, err)
+			util.Log().Panic("Failed to parse config section %q: %s", sectionName, err)
 		}
+	}
+
+	// 映射数据库配置覆盖
+	for _, key := range cfg.Section("OptionOverwrite").Keys() {
+		OptionOverwrite[key.Name()] = key.Value()
 	}
 
 	// 重设log等级

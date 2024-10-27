@@ -5,6 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cluster"
@@ -13,11 +17,9 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/task"
 	"github.com/cloudreve/Cloudreve/v3/pkg/task/slavetask"
+	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
-	"net/http"
-	"net/url"
-	"time"
 )
 
 // SlaveDownloadService 从机文件下載服务
@@ -30,6 +32,7 @@ type SlaveDownloadService struct {
 // SlaveFileService 从机单文件文件相关服务
 type SlaveFileService struct {
 	PathEncoded string `uri:"path" binding:"required"`
+	Ext         string `uri:"ext"`
 }
 
 // SlaveFilesService 从机多文件相关服务
@@ -48,14 +51,14 @@ func (service *SlaveDownloadService) ServeFile(ctx context.Context, c *gin.Conte
 	// 创建文件系统
 	fs, err := filesystem.NewAnonymousFileSystem()
 	if err != nil {
-		return serializer.Err(serializer.CodePolicyNotAllowed, err.Error(), err)
+		return serializer.Err(serializer.CodeCreateFSError, "", err)
 	}
 	defer fs.Recycle()
 
 	// 解码文件路径
 	fileSource, err := base64.RawURLEncoding.DecodeString(service.PathEncoded)
 	if err != nil {
-		return serializer.ParamErr("无法解析的文件地址", err)
+		return serializer.Err(serializer.CodeFileNotFound, "", err)
 	}
 
 	// 根据URL里的信息创建一个文件对象和用户对象
@@ -96,7 +99,7 @@ func (service *SlaveFilesService) Delete(ctx context.Context, c *gin.Context) se
 	// 创建文件系统
 	fs, err := filesystem.NewAnonymousFileSystem()
 	if err != nil {
-		return serializer.Err(serializer.CodePolicyNotAllowed, err.Error(), err)
+		return serializer.Err(serializer.CodeCreateFSError, "", err)
 	}
 	defer fs.Recycle()
 
@@ -109,7 +112,7 @@ func (service *SlaveFilesService) Delete(ctx context.Context, c *gin.Context) se
 		return serializer.Response{
 			Code:  serializer.CodeNotFullySuccess,
 			Data:  string(data),
-			Msg:   fmt.Sprintf("有 %d 个文件未能成功删除", len(failed)),
+			Msg:   fmt.Sprintf("Failed to delete %d files(s)", len(failed)),
 			Error: err.Error(),
 		}
 	}
@@ -121,21 +124,21 @@ func (service *SlaveFileService) Thumb(ctx context.Context, c *gin.Context) seri
 	// 创建文件系统
 	fs, err := filesystem.NewAnonymousFileSystem()
 	if err != nil {
-		return serializer.Err(serializer.CodePolicyNotAllowed, err.Error(), err)
+		return serializer.Err(serializer.CodeCreateFSError, "", err)
 	}
 	defer fs.Recycle()
 
 	// 解码文件路径
 	fileSource, err := base64.RawURLEncoding.DecodeString(service.PathEncoded)
 	if err != nil {
-		return serializer.ParamErr("无法解析的文件地址", err)
+		return serializer.Err(serializer.CodeFileNotFound, "", err)
 	}
-	fs.FileTarget = []model.File{{SourceName: string(fileSource), PicInfo: "1,1"}}
+	fs.FileTarget = []model.File{{SourceName: string(fileSource), Name: fmt.Sprintf("%s.%s", fileSource, service.Ext), PicInfo: "1,1"}}
 
 	// 获取缩略图
 	resp, err := fs.GetThumb(ctx, 0)
 	if err != nil {
-		return serializer.Err(serializer.CodeNotSet, "无法获取缩略图", err)
+		return serializer.Err(serializer.CodeNotSet, "Failed to get thumb", err)
 	}
 
 	defer resp.Content.Close()
@@ -155,7 +158,7 @@ func CreateTransferTask(c *gin.Context, req *serializer.SlaveTransferReq) serial
 		if err := cluster.DefaultController.SubmitTask(job.MasterID, job, req.Hash(job.MasterID), func(job interface{}) {
 			task.TaskPoll.Submit(job.(task.Job))
 		}); err != nil {
-			return serializer.Err(serializer.CodeInternalSetting, "任务创建失败", err)
+			return serializer.Err(serializer.CodeCreateTaskError, "", err)
 		}
 
 		return serializer.Response{}
@@ -166,12 +169,17 @@ func CreateTransferTask(c *gin.Context, req *serializer.SlaveTransferReq) serial
 
 // SlaveListService 从机上传会话服务
 type SlaveCreateUploadSessionService struct {
-	Session serializer.UploadSession `json:"session" binding:"required"`
-	TTL     int64                    `json:"ttl"`
+	Session   serializer.UploadSession `json:"session" binding:"required"`
+	TTL       int64                    `json:"ttl"`
+	Overwrite bool                     `json:"overwrite"`
 }
 
 // Create 从机创建上传会话
 func (service *SlaveCreateUploadSessionService) Create(ctx context.Context, c *gin.Context) serializer.Response {
+	if !service.Overwrite && util.Exists(service.Session.SavePath) {
+		return serializer.Err(serializer.CodeConflict, "placeholder file already exist", nil)
+	}
+
 	err := cache.Set(
 		filesystem.UploadSessionCachePrefix+service.Session.Key,
 		service.Session,

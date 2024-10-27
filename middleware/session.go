@@ -1,36 +1,47 @@
 package middleware
 
 import (
+	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
+	"github.com/cloudreve/Cloudreve/v3/pkg/sessionstore"
+	"net/http"
+	"strings"
+
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/memstore"
-	"github.com/gin-contrib/sessions/redis"
 	"github.com/gin-gonic/gin"
 )
 
 // Store session存储
-var Store memstore.Store
+var Store sessions.Store
 
 // Session 初始化session
 func Session(secret string) gin.HandlerFunc {
 	// Redis设置不为空，且非测试模式时使用Redis
-	if conf.RedisConfig.Server != "" && gin.Mode() != gin.TestMode {
-		var err error
-		Store, err = redis.NewStoreWithDB(10, conf.RedisConfig.Network, conf.RedisConfig.Server, conf.RedisConfig.Password, conf.RedisConfig.DB, []byte(secret))
-		if err != nil {
-			util.Log().Panic("无法连接到 Redis：%s", err)
-		}
+	Store = sessionstore.NewStore(cache.Store, []byte(secret))
 
-		util.Log().Info("已连接到 Redis 服务器：%s", conf.RedisConfig.Server)
-	} else {
-		Store = memstore.NewStore([]byte(secret))
+	sameSiteMode := http.SameSiteDefaultMode
+	switch strings.ToLower(conf.CORSConfig.SameSite) {
+	case "default":
+		sameSiteMode = http.SameSiteDefaultMode
+	case "none":
+		sameSiteMode = http.SameSiteNoneMode
+	case "strict":
+		sameSiteMode = http.SameSiteStrictMode
+	case "lax":
+		sameSiteMode = http.SameSiteLaxMode
 	}
 
 	// Also set Secure: true if using SSL, you should though
-	// TODO:same-site policy
-	Store.Options(sessions.Options{HttpOnly: true, MaxAge: 7 * 86400, Path: "/"})
+	Store.Options(sessions.Options{
+		HttpOnly: true,
+		MaxAge:   60 * 86400,
+		Path:     "/",
+		SameSite: sameSiteMode,
+		Secure:   conf.CORSConfig.Secure,
+	})
+
 	return sessions.Sessions("cloudreve-session", Store)
 }
 
@@ -50,7 +61,7 @@ func CSRFCheck() gin.HandlerFunc {
 			return
 		}
 
-		c.JSON(200, serializer.Err(serializer.CodeNoPermissionErr, "来源非法", nil))
+		c.JSON(200, serializer.Err(serializer.CodeNoPermissionErr, "Invalid origin", nil))
 		c.Abort()
 	}
 }

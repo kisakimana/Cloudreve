@@ -36,10 +36,11 @@ type Object struct {
 	ID            string    `json:"id"`
 	Name          string    `json:"name"`
 	Path          string    `json:"path"`
-	Pic           string    `json:"pic"`
+	Thumb         bool      `json:"thumb"`
 	Size          uint64    `json:"size"`
 	Type          string    `json:"type"`
 	Date          time.Time `json:"date"`
+	CreateDate    time.Time `json:"create_date"`
 	Key           string    `json:"key,omitempty"`
 	SourceEnabled bool      `json:"source_enabled"`
 }
@@ -74,4 +75,58 @@ func BuildObjectList(parent uint, objects []Object, policy *model.Policy) Object
 	}
 
 	return res
+}
+
+// Sources 获取外链的结果响应
+type Sources struct {
+	URL    string `json:"url"`
+	Name   string `json:"name"`
+	Parent uint   `json:"parent"`
+	Error  string `json:"error,omitempty"`
+}
+
+// DocPreviewSession 文档预览会话响应
+type DocPreviewSession struct {
+	URL            string `json:"url"`
+	AccessToken    string `json:"access_token,omitempty"`
+	AccessTokenTTL int64  `json:"access_token_ttl,omitempty"`
+}
+
+// WopiFileInfo Response for `CheckFileInfo`
+type WopiFileInfo struct {
+	// Required
+	BaseFileName string
+	Version      string
+	Size         int64
+
+	// Breadcrumb
+	BreadcrumbBrandName  string
+	BreadcrumbBrandUrl   string
+	BreadcrumbFolderName string
+	BreadcrumbFolderUrl  string
+
+	// Post Message
+	FileSharingPostMessage bool
+	ClosePostMessage       bool
+	PostMessageOrigin      string
+
+	// Other miscellaneous properties
+	FileNameMaxLength int
+	LastModifiedTime  string
+
+	// User metadata
+	IsAnonymousUser  bool
+	UserFriendlyName string
+	UserId           string
+	OwnerId          string
+
+	// Permission
+	ReadOnly      bool
+	UserCanRename bool
+	UserCanReview bool
+	UserCanWrite  bool
+
+	SupportsRename    bool
+	SupportsReviewing bool
+	SupportsUpdate    bool
 }

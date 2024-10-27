@@ -19,8 +19,9 @@ type FileService struct {
 
 // FileBatchService 文件批量操作服务
 type FileBatchService struct {
-	ID    []uint `json:"id" binding:"min=1"`
-	Force bool   `json:"force"`
+	ID         []uint `json:"id" binding:"min=1"`
+	Force      bool   `json:"force"`
+	UnlinkOnly bool   `json:"unlink"`
 }
 
 // ListFolderService 列目录结构
@@ -36,13 +37,13 @@ func (service *ListFolderService) List(c *gin.Context) serializer.Response {
 		// 列取存储策略中的目录
 		policy, err := model.GetPolicyByID(service.ID)
 		if err != nil {
-			return serializer.Err(serializer.CodeNotFound, "存储策略不存在", err)
+			return serializer.Err(serializer.CodePolicyNotExist, "", err)
 		}
 
 		// 创建文件系统
 		fs, err := filesystem.NewAnonymousFileSystem()
 		if err != nil {
-			return serializer.Err(serializer.CodeInternalSetting, "无法创建文件系统", err)
+			return serializer.Err(serializer.CodeCreateFSError, "", err)
 		}
 		defer fs.Recycle()
 
@@ -50,7 +51,7 @@ func (service *ListFolderService) List(c *gin.Context) serializer.Response {
 		fs.Policy = &policy
 		res, err := fs.ListPhysical(c.Request.Context(), service.Path)
 		if err != nil {
-			return serializer.Err(serializer.CodeIOFailed, "无法列取目录", err)
+			return serializer.Err(serializer.CodeListFilesError, "", err)
 		}
 
 		return serializer.Response{
@@ -63,20 +64,20 @@ func (service *ListFolderService) List(c *gin.Context) serializer.Response {
 	// 查找用户
 	user, err := model.GetUserByID(service.ID)
 	if err != nil {
-		return serializer.Err(serializer.CodeNotFound, "用户不存在", err)
+		return serializer.Err(serializer.CodeUserNotFound, "", err)
 	}
 
 	// 创建文件系统
 	fs, err := filesystem.NewFileSystem(&user)
 	if err != nil {
-		return serializer.Err(serializer.CodeInternalSetting, "无法创建文件系统", err)
+		return serializer.Err(serializer.CodeCreateFSError, "", err)
 	}
 	defer fs.Recycle()
 
 	// 列取目录
 	res, err := fs.List(c.Request.Context(), service.Path, nil)
 	if err != nil {
-		return serializer.Err(serializer.CodeIOFailed, "无法列取目录", err)
+		return serializer.Err(serializer.CodeListFilesError, "", err)
 	}
 
 	return serializer.Response{
@@ -88,7 +89,7 @@ func (service *ListFolderService) List(c *gin.Context) serializer.Response {
 func (service *FileBatchService) Delete(c *gin.Context) serializer.Response {
 	files, err := model.GetFilesByIDs(service.ID, 0)
 	if err != nil {
-		return serializer.DBErr("无法列出待删除文件", err)
+		return serializer.DBErr("Failed to list files for deleting", err)
 	}
 
 	// 根据用户分组
@@ -103,15 +104,22 @@ func (service *FileBatchService) Delete(c *gin.Context) serializer.Response {
 	// 异步执行删除
 	go func(files map[uint][]model.File) {
 		for uid, file := range files {
+			var (
+				fs  *filesystem.FileSystem
+				err error
+			)
 			user, err := model.GetUserByID(uid)
 			if err != nil {
-				continue
-			}
-
-			fs, err := filesystem.NewFileSystem(&user)
-			if err != nil {
-				fs.Recycle()
-				continue
+				fs, err = filesystem.NewAnonymousFileSystem()
+				if err != nil {
+					continue
+				}
+			} else {
+				fs, err = filesystem.NewFileSystem(&user)
+				if err != nil {
+					fs.Recycle()
+					continue
+				}
 			}
 
 			// 汇总文件ID
@@ -121,7 +129,7 @@ func (service *FileBatchService) Delete(c *gin.Context) serializer.Response {
 			}
 
 			// 执行删除
-			fs.Delete(context.Background(), []uint{}, ids, service.Force)
+			fs.Delete(context.Background(), []uint{}, ids, service.Force, service.UnlinkOnly)
 			fs.Recycle()
 		}
 	}(userFile)
@@ -135,7 +143,7 @@ func (service *FileBatchService) Delete(c *gin.Context) serializer.Response {
 func (service *FileService) Get(c *gin.Context) serializer.Response {
 	file, err := model.GetFilesByIDs([]uint{service.ID}, 0)
 	if err != nil {
-		return serializer.Err(serializer.CodeNotFound, "文件不存在", err)
+		return serializer.Err(serializer.CodeFileNotFound, "", err)
 	}
 
 	ctx := context.WithValue(context.Background(), fsctx.FileModelCtx, &file[0])

@@ -69,11 +69,16 @@ func (fs *FileSystem) Copy(ctx context.Context, dirs, files []uint, src, dst str
 	// 记录复制的文件的总容量
 	var newUsedStorage uint64
 
+	// 设置webdav目标名
+	if dstName, ok := ctx.Value(fsctx.WebdavDstName).(string); ok {
+		dstFolder.WebdavDstName = dstName
+	}
+
 	// 复制目录
 	if len(dirs) > 0 {
 		subFileSizes, err := srcFolder.CopyFolderTo(dirs[0], dstFolder)
 		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "操作失败，可能有重名冲突", err)
+			return ErrObjectNotExist.WithError(err)
 		}
 		newUsedStorage += subFileSizes
 	}
@@ -82,7 +87,7 @@ func (fs *FileSystem) Copy(ctx context.Context, dirs, files []uint, src, dst str
 	if len(files) > 0 {
 		subFileSizes, err := srcFolder.MoveOrCopyFileTo(files, dstFolder, true)
 		if err != nil {
-			return serializer.NewError(serializer.CodeDBError, "操作失败，可能有重名冲突", err)
+			return ErrObjectNotExist.WithError(err)
 		}
 		newUsedStorage += subFileSizes
 	}
@@ -103,16 +108,21 @@ func (fs *FileSystem) Move(ctx context.Context, dirs, files []uint, src, dst str
 		return ErrPathNotExist
 	}
 
+	// 设置webdav目标名
+	if dstName, ok := ctx.Value(fsctx.WebdavDstName).(string); ok {
+		dstFolder.WebdavDstName = dstName
+	}
+
 	// 处理目录及子文件移动
 	err := srcFolder.MoveFolderTo(dirs, dstFolder)
 	if err != nil {
-		return serializer.NewError(serializer.CodeDBError, "操作失败，可能有重名冲突", err)
+		return ErrFileExisted.WithError(err)
 	}
 
 	// 处理文件移动
 	_, err = srcFolder.MoveOrCopyFileTo(files, dstFolder, false)
 	if err != nil {
-		return serializer.NewError(serializer.CodeDBError, "操作失败，可能有重名冲突", err)
+		return ErrFileExisted.WithError(err)
 	}
 
 	// 移动文件
@@ -120,8 +130,9 @@ func (fs *FileSystem) Move(ctx context.Context, dirs, files []uint, src, dst str
 	return err
 }
 
-// Delete 递归删除对象, force 为 true 时强制删除文件记录，忽略物理删除是否成功
-func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force bool) error {
+// Delete 递归删除对象, force 为 true 时强制删除文件记录，忽略物理删除是否成功;
+// unlink 为 true 时只删除虚拟文件系统的文件记录，不删除物理文件。
+func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force, unlink bool) error {
 	// 已删除的文件ID
 	var deletedFiles = make([]*model.File, 0, len(fs.FileTarget))
 	// 删除失败的文件的父目录ID
@@ -155,7 +166,10 @@ func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force bool
 	policyGroup := fs.GroupFileByPolicy(ctx, filesToBeDelete)
 
 	// 按照存储策略分组删除对象
-	failed := fs.deleteGroupedFile(ctx, policyGroup)
+	failed := make(map[uint][]string)
+	if !unlink {
+		failed = fs.deleteGroupedFile(ctx, policyGroup)
+	}
 
 	// 整理删除结果
 	for i := 0; i < len(fs.FileTarget); i++ {
@@ -206,7 +220,7 @@ func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force bool
 	if notDeleted := len(fs.FileTarget) - len(deletedFiles); notDeleted > 0 {
 		return serializer.NewError(
 			serializer.CodeNotFullySuccess,
-			fmt.Sprintf("有 %d 个文件未能成功删除", notDeleted),
+			fmt.Sprintf("Failed to delete %d file(s).", notDeleted),
 			nil,
 		)
 	}
@@ -221,6 +235,15 @@ func (fs *FileSystem) ListDeleteDirs(ctx context.Context, ids []uint) error {
 	if err != nil {
 		return ErrDBListObjects.WithError(err)
 	}
+
+	// 忽略根目录
+	for i := 0; i < len(folders); i++ {
+		if folders[i].ParentID == nil {
+			folders = append(folders[:i], folders[i+1:]...)
+			break
+		}
+	}
+
 	fs.SetTargetDir(&folders)
 
 	// 检索目录下的子文件
@@ -325,13 +348,13 @@ func (fs *FileSystem) listObjects(ctx context.Context, parent string, files []mo
 		}
 
 		objects = append(objects, serializer.Object{
-			ID:   hashid.HashID(subFolder.ID, hashid.FolderID),
-			Name: subFolder.Name,
-			Path: processedPath,
-			Pic:  "",
-			Size: 0,
-			Type: "dir",
-			Date: subFolder.CreatedAt,
+			ID:         hashid.HashID(subFolder.ID, hashid.FolderID),
+			Name:       subFolder.Name,
+			Path:       processedPath,
+			Size:       0,
+			Type:       "dir",
+			Date:       subFolder.UpdatedAt,
+			CreateDate: subFolder.CreatedAt,
 		})
 	}
 
@@ -349,11 +372,12 @@ func (fs *FileSystem) listObjects(ctx context.Context, parent string, files []mo
 				ID:            hashid.HashID(file.ID, hashid.FileID),
 				Name:          file.Name,
 				Path:          processedPath,
-				Pic:           file.PicInfo,
+				Thumb:         file.ShouldLoadThumb(),
 				Size:          file.Size,
 				Type:          "file",
-				Date:          file.CreatedAt,
+				Date:          file.UpdatedAt,
 				SourceEnabled: file.GetPolicy().IsOriginLinkEnable,
+				CreateDate:    file.CreatedAt,
 			}
 			if shareKey != "" {
 				newFile.Key = shareKey
@@ -365,10 +389,18 @@ func (fs *FileSystem) listObjects(ctx context.Context, parent string, files []mo
 	return objects
 }
 
-// CreateDirectory 根据给定的完整创建目录，支持递归创建
+// CreateDirectory 根据给定的完整创建目录，支持递归创建。如果目录已存在，则直接
+// 返回已存在的目录。
 func (fs *FileSystem) CreateDirectory(ctx context.Context, fullPath string) (*model.Folder, error) {
-	if fullPath == "/" || fullPath == "." || fullPath == "" {
+	if fullPath == "." || fullPath == "" {
 		return nil, ErrRootProtected
+	}
+
+	if fullPath == "/" {
+		if fs.Root != nil {
+			return fs.Root, nil
+		}
+		return fs.User.Root()
 	}
 
 	// 获取要创建目录的父路径和目录名
@@ -387,10 +419,6 @@ func (fs *FileSystem) CreateDirectory(ctx context.Context, fullPath string) (*mo
 	// 父目录是否存在
 	isExist, parent := fs.IsPathExist(base)
 	if !isExist {
-		// 递归创建父目录
-		if _, ok := ctx.Value(fsctx.IgnoreDirectoryConflictCtx).(bool); !ok {
-			ctx = context.WithValue(ctx, fsctx.IgnoreDirectoryConflictCtx, true)
-		}
 		newParent, err := fs.CreateDirectory(ctx, base)
 		if err != nil {
 			return nil, err
@@ -412,11 +440,9 @@ func (fs *FileSystem) CreateDirectory(ctx context.Context, fullPath string) (*mo
 	_, err := newFolder.Create()
 
 	if err != nil {
-		if _, ok := ctx.Value(fsctx.IgnoreDirectoryConflictCtx).(bool); !ok {
-			return nil, ErrFolderExisted
-		}
-
+		return nil, fmt.Errorf("failed to create folder: %w", err)
 	}
+
 	return &newFolder, nil
 }
 

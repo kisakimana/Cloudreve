@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
+	"time"
+
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cluster"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
@@ -13,8 +16,6 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/mq"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
-	"net/url"
-	"time"
 )
 
 // Driver 影子存储策略，将上传任务指派给从机节点处理，并等待从机通知上传结果
@@ -30,7 +31,7 @@ func NewDriver(node cluster.Node, handler driver.Handler, policy *model.Policy) 
 	var endpoint *url.URL
 	if serverURL, err := url.Parse(node.DBModel().Server); err == nil {
 		var controller *url.URL
-		controller, _ = url.Parse("/api/v3/slave")
+		controller, _ = url.Parse("/api/v3/slave/")
 		endpoint = serverURL.ResolveReference(controller)
 	}
 
@@ -52,14 +53,10 @@ func NewDriver(node cluster.Node, handler driver.Handler, policy *model.Policy) 
 func (d *Driver) Put(ctx context.Context, file fsctx.FileHeader) error {
 	defer file.Close()
 
-	src, ok := ctx.Value(fsctx.SlaveSrcPath).(string)
-	if !ok {
-		return ErrSlaveSrcPathNotExist
-	}
-
+	fileInfo := file.Info()
 	req := serializer.SlaveTransferReq{
-		Src:    src,
-		Dst:    file.Info().SavePath,
+		Src:    fileInfo.Src,
+		Dst:    fileInfo.SavePath,
 		Policy: d.policy,
 	}
 
@@ -105,11 +102,11 @@ func (d *Driver) Get(ctx context.Context, path string) (response.RSCloser, error
 	return nil, ErrNotImplemented
 }
 
-func (d *Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
+func (d *Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
 	return nil, ErrNotImplemented
 }
 
-func (d *Driver) Source(ctx context.Context, path string, url url.URL, ttl int64, isDownload bool, speed int) (string, error) {
+func (d *Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 	return "", ErrNotImplemented
 }
 
@@ -122,6 +119,6 @@ func (d *Driver) List(ctx context.Context, path string, recursive bool) ([]respo
 }
 
 // 取消上传凭证
-func (handler Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
+func (d *Driver) CancelToken(ctx context.Context, uploadSession *serializer.UploadSession) error {
 	return nil
 }

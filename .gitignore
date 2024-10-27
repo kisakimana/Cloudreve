@@ -8,6 +8,7 @@ cloudreve
 *.db
 *.bin
 /release/
+assets.zip
 
 # Test binary, build with `go test -c`
 *.test
@@ -28,3 +29,5 @@ version.lock
 conf/conf.ini
 /statik/
 .vscode/
+
+dist/

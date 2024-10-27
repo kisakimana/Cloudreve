@@ -8,6 +8,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/cos"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/googledrive"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/local"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/onedrive"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/oss"
@@ -121,12 +122,11 @@ func NewAnonymousFileSystem() (*FileSystem, error) {
 
 // DispatchHandler 根据存储策略分配文件适配器
 func (fs *FileSystem) DispatchHandler() error {
-	currentPolicy := fs.Policy
-	policyType := currentPolicy.Type
-
-	if currentPolicy == nil {
-		return ErrUnknownPolicyType
+	if fs.Policy == nil {
+		return errors.New("未设置存储策略")
 	}
+	policyType := fs.Policy.Type
+	currentPolicy := fs.Policy
 
 	switch policyType {
 	case "mock", "anonymous":
@@ -144,16 +144,12 @@ func (fs *FileSystem) DispatchHandler() error {
 
 		fs.Handler = handler
 	case "qiniu":
-		fs.Handler = qiniu.Driver{
-			Policy: currentPolicy,
-		}
+		fs.Handler = qiniu.NewDriver(currentPolicy)
 		return nil
 	case "oss":
-		fs.Handler = oss.Driver{
-			Policy:     currentPolicy,
-			HTTPClient: request.NewClient(),
-		}
-		return nil
+		handler, err := oss.NewDriver(currentPolicy)
+		fs.Handler = handler
+		return err
 	case "upyun":
 		fs.Handler = upyun.Driver{
 			Policy: currentPolicy,
@@ -178,10 +174,13 @@ func (fs *FileSystem) DispatchHandler() error {
 		}
 		return nil
 	case "s3":
-		fs.Handler = s3.Driver{
-			Policy: currentPolicy,
-		}
-		return nil
+		handler, err := s3.NewDriver(currentPolicy)
+		fs.Handler = handler
+		return err
+	case "googledrive":
+		handler, err := googledrive.NewDriver(currentPolicy)
+		fs.Handler = handler
+		return err
 	default:
 		return ErrUnknownPolicyType
 	}
@@ -207,9 +206,9 @@ func NewFileSystemFromCallback(c *gin.Context) (*FileSystem, error) {
 	}
 
 	// 获取回调会话
-	callbackSessionRaw, ok := c.Get("callbackSession")
+	callbackSessionRaw, ok := c.Get(UploadSessionCtx)
 	if !ok {
-		return nil, errors.New("找不到回调会话")
+		return nil, errors.New("upload session not exist")
 	}
 	callbackSession := callbackSessionRaw.(*serializer.UploadSession)
 

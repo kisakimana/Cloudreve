@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	model "github.com/cloudreve/Cloudreve/v3/models"
@@ -48,9 +49,6 @@ func (fs *FileSystem) AddFile(ctx context.Context, parent *model.Folder, file fs
 	// 添加文件记录前的钩子
 	err := fs.Trigger(ctx, "BeforeAddFile", file)
 	if err != nil {
-		if err := fs.Trigger(ctx, "BeforeAddFileFailed", file); err != nil {
-			util.Log().Debug("BeforeAddFileFailed 钩子执行失败，%s", err)
-		}
 		return nil, err
 	}
 
@@ -66,15 +64,11 @@ func (fs *FileSystem) AddFile(ctx context.Context, parent *model.Folder, file fs
 		UploadSessionID:    uploadInfo.UploadSessionID,
 	}
 
-	if fs.Policy.IsThumbExist(uploadInfo.FileName) {
-		newFile.PicInfo = "1,1"
-	}
-
 	err = newFile.Create()
 
 	if err != nil {
 		if err := fs.Trigger(ctx, "AfterValidateFailed", file); err != nil {
-			util.Log().Debug("AfterValidateFailed 钩子执行失败，%s", err)
+			util.Log().Debug("AfterValidateFailed hook execution failed: %s", err)
 		}
 		return nil, ErrFileExisted.WithError(err)
 	}
@@ -99,9 +93,10 @@ func (fs *FileSystem) GetPhysicalFileContent(ctx context.Context, path string) (
 }
 
 // Preview 预览文件
-//   path   -   文件虚拟路径
-//   isText -   是否为文本文件，文本文件会忽略重定向，直接由
-//              服务端拉取中转给用户，故会对文件大小进行限制
+//
+//	path   -   文件虚拟路径
+//	isText -   是否为文本文件，文本文件会忽略重定向，直接由
+//	           服务端拉取中转给用户，故会对文件大小进行限制
 func (fs *FileSystem) Preview(ctx context.Context, id uint, isText bool) (*response.ContentResponse, error) {
 	err := fs.resetFileIDIfNotExist(ctx, id)
 	if err != nil {
@@ -176,10 +171,12 @@ func (fs *FileSystem) deleteGroupedFile(ctx context.Context, files map[uint][]*m
 	// 失败的文件列表
 	// TODO 并行删除
 	failed := make(map[uint][]string, len(files))
+	thumbs := make([]string, 0)
 
 	for policyID, toBeDeletedFiles := range files {
 		// 列举出需要物理删除的文件的物理路径
 		sourceNamesAll := make([]string, 0, len(toBeDeletedFiles))
+		uploadSessions := make([]*serializer.UploadSession, 0, len(toBeDeletedFiles))
 
 		for i := 0; i < len(toBeDeletedFiles); i++ {
 			sourceNamesAll = append(sourceNamesAll, toBeDeletedFiles[i].SourceName)
@@ -187,13 +184,13 @@ func (fs *FileSystem) deleteGroupedFile(ctx context.Context, files map[uint][]*m
 			if toBeDeletedFiles[i].UploadSessionID != nil {
 				if session, ok := cache.Get(UploadSessionCachePrefix + *toBeDeletedFiles[i].UploadSessionID); ok {
 					uploadSession := session.(serializer.UploadSession)
-					if err := fs.Handler.CancelToken(ctx, &uploadSession); err != nil {
-						util.Log().Warning("无法取消 [%s] 的上传会话: %s", err)
-					}
-
-					cache.Deletes([]string{*toBeDeletedFiles[i].UploadSessionID}, UploadSessionCachePrefix)
+					uploadSessions = append(uploadSessions, &uploadSession)
 				}
+			}
 
+			// Check if sidecar thumb file exist
+			if model.IsTrueVal(toBeDeletedFiles[i].MetadataSerialized[model.ThumbSidecarMetadataKey]) {
+				thumbs = append(thumbs, toBeDeletedFiles[i].ThumbFile())
 			}
 		}
 
@@ -205,9 +202,21 @@ func (fs *FileSystem) deleteGroupedFile(ctx context.Context, files map[uint][]*m
 			continue
 		}
 
+		// 取消上传会话
+		for _, upSession := range uploadSessions {
+			if err := fs.Handler.CancelToken(ctx, upSession); err != nil {
+				util.Log().Warning("Failed to cancel upload session for %q: %s", upSession.Name, err)
+			}
+
+			cache.Deletes([]string{upSession.Key}, UploadSessionCachePrefix)
+		}
+
 		// 执行删除
-		failedFile, _ := fs.Handler.Delete(ctx, sourceNamesAll)
-		failed[policyID] = failedFile
+		toBeDeletedSrcs := append(sourceNamesAll, thumbs...)
+		failedFile, _ := fs.Handler.Delete(ctx, toBeDeletedSrcs)
+
+		// Exclude failed results related to thumb file
+		failed[policyID] = util.SliceDifference(failedFile, thumbs)
 	}
 
 	return failed
@@ -266,14 +275,14 @@ func (fs *FileSystem) GetSource(ctx context.Context, fileID uint) (string, error
 	if !fs.Policy.IsOriginLinkEnable {
 		return "", serializer.NewError(
 			serializer.CodePolicyNotAllowed,
-			"当前存储策略无法获得外链",
+			"This policy is not enabled for getting source link",
 			nil,
 		)
 	}
 
 	source, err := fs.SignURL(ctx, &fs.FileTarget[0], 0, false)
 	if err != nil {
-		return "", serializer.NewError(serializer.CodeNotSet, "无法获取外链", err)
+		return "", serializer.NewError(serializer.CodeNotSet, "Failed to get source link", err)
 	}
 
 	return source, nil
@@ -291,10 +300,9 @@ func (fs *FileSystem) SignURL(ctx context.Context, file *model.File, ttl int64, 
 
 	// 签名最终URL
 	// 生成外链地址
-	siteURL := model.GetSiteURL()
-	source, err := fs.Handler.Source(ctx, fs.FileTarget[0].SourceName, *siteURL, ttl, isDownload, fs.User.Group.SpeedLimit)
+	source, err := fs.Handler.Source(ctx, fs.FileTarget[0].SourceName, ttl, isDownload, fs.User.Group.SpeedLimit)
 	if err != nil {
-		return "", serializer.NewError(serializer.CodeNotSet, "无法获取外链", err)
+		return "", serializer.NewError(serializer.CodeNotSet, "Failed to get source link", err)
 	}
 
 	return source, nil
@@ -358,7 +366,21 @@ func (fs *FileSystem) resetPolicyToFirstFile(ctx context.Context) error {
 
 // Search 搜索文件
 func (fs *FileSystem) Search(ctx context.Context, keywords ...interface{}) ([]serializer.Object, error) {
-	files, _ := model.GetFilesByKeywords(fs.User.ID, keywords...)
+	parents := make([]uint, 0)
+
+	// 如果限定了根目录，则只在这个根目录下搜索。
+	if fs.Root != nil {
+		allFolders, err := model.GetRecursiveChildFolder([]uint{fs.Root.ID}, fs.User.ID, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list all folders: %w", err)
+		}
+
+		for _, folder := range allFolders {
+			parents = append(parents, folder.ID)
+		}
+	}
+
+	files, _ := model.GetFilesByKeywords(fs.User.ID, parents, keywords...)
 	fs.SetTargetFile(&files)
 
 	return fs.listObjects(ctx, "/", files, nil, nil), nil
